@@ -23,7 +23,7 @@
 
 ### **optimization techniques for WAN 2.1/2.2 models. It uses a sophisticated lazy loading**
 
-### **strategy to prevent VRAM spikes during model loading while maintaining optimal performance.**
+### **strategy to prevent VRAM spikes at model loading while maintaining optimal performance.**
 
     
 ## Key Features
