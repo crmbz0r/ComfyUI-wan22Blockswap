@@ -35,6 +35,9 @@
 -   **Smart Memory Management**: Automatic cleanup and memory optimization
 -   **Debug Support**: Comprehensive logging and performance monitoring
 
+          
+        
+
 ## 📋 Table of Contents
 
 -   [🛠️ Installation](https://github.com/crmbz0r/ComfyUI_Wan22Blockswap#%EF%B8%8F-installation)
@@ -45,6 +48,8 @@
 -   [🏗️ Architecture](https://github.com/crmbz0r/ComfyUI_Wan22Blockswap#%EF%B8%8F-architecture)
 -   [🤝 Contributing](https://github.com/crmbz0r/ComfyUI_Wan22Blockswap#-contributing)
 -   [📝 License](https://github.com/crmbz0r/ComfyUI_Wan22Blockswap#-license)
+
+        
 
 ## 🛠️ Installation
 
@@ -68,7 +73,9 @@ git clone https://github.com/yourusername/ComfyUI-Wan22Blockswap.git
 
 If you're using ComfyUI Manager, search for "Wan22Blockswap" in the available nodes list and install directly.
 
-## 🎯 Usage
+        
+
+# 🎯 Usage
 
 ### Basic Usage
 
@@ -92,6 +99,8 @@ optimized_model = wan22BlockSwap(
     block_swap_debug=True        # Enable monitoring
 )
 ```
+
+        
 
 ## ⚙️ Parameters
 
@@ -157,6 +166,8 @@ blocks_to_swap=0  # No swapping needed
 offload_txt_emb=False
 ```
 
+        
+
 ## 📊 Performance
 
 ### Memory Savings
@@ -169,6 +180,8 @@ offload_txt_emb=False
 | 20             | ~15.4GB      | ~4GB                | Low                |
 | 30             | ~23.1GB      | ~6GB                | Medium             |
 | 40             | ~30.8GB      | ~8GB                | Medium-High        |
+
+        
 
 **💡 Key Insights:**
 
@@ -223,6 +236,8 @@ When `block_swap_debug=True`, you'll see detailed information:
 [BlockSwap] Peak VRAM usage should be MUCH lower!
 ```
 
+        
+
 ## 🔧 Compatibility
 
 ### Supported Models
@@ -244,6 +259,8 @@ When `block_swap_debug=True`, you'll see detailed information:
 -   ✅ Windows 10/11
 -   ✅ Linux (Ubuntu 18.04+, CentOS 7+)
 -   ✅ macOS (Apple Silicon with MPS support)
+
+        
 
 ## 🏗️ Architecture
 
@@ -274,6 +291,8 @@ The lazy loading approach works in 4 phases:
 -   **Device Synchronization**: Proper GPU synchronization to prevent race conditions
 -   **Error Handling**: Graceful handling of memory allocation failures
 
+        
+
 ## 🤝 Contributing
 
 We welcome contributions! Please see our [Contributing Guide](CONTRIBUTING.md) for details.
@@ -298,9 +317,13 @@ black .
 flake8 .
 ```
 
+        
+
 ## 📝 License
 
 This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
+
+        
 
 ## 🙏 Acknowledgments
 
@@ -313,6 +336,8 @@ This project builds upon the excellent work of the following projects and commun
 -   The GGUF community for their quantization efforts
 -   All contributors and testers who helped improve this project
 
+        
+
 ## 📞 Support
 
 If you encounter issues or have questions:
@@ -321,6 +346,8 @@ If you encounter issues or have questions:
 2. Search existing [Issues](https://github.com/crmbz0r/ComfyUI-Wan22Blockswap/issues)
 3. Create a new issue with detailed information
 4. Join our Discord community (link in repository)
+
+        
 
 ## ❓ FAQ
 
@@ -339,6 +366,8 @@ If you encounter issues or have questions:
 ### Q: What happens if I run out of CPU RAM?
 
 **A:** The system will gracefully handle memory allocation failures and skip swapping blocks that can't be allocated, falling back to GPU memory.
+
+        
 
 ## 🔄 Changelog
 
