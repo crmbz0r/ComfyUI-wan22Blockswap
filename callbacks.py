@@ -3,6 +3,10 @@
 This module contains the callback functions that are executed during
 model loading and cleanup. These callbacks implement the lazy loading
 strategy and proper cleanup of swapped blocks.
+
+The cleanup_callback integrates with BlockSwapModelTracker to make smart
+cleanup decisions based on session state, preventing cleanup from deleting
+blocks that subsequent loops still need.
 """
 
 import torch
@@ -12,6 +16,7 @@ from tqdm import tqdm
 
 from .block_manager import BlockManager, BlockSwapTracker
 from .utils import log_debug, sync_gpu, clear_device_caches
+from .model_tracker import BlockSwapModelTracker, CleanupDecision
 
 
 def lazy_load_callback(
@@ -126,11 +131,39 @@ def cleanup_callback(model_patcher: Any) -> None:
     ON_CLEANUP callback for comprehensive cleanup operations.
 
     Handles both GGUF and native models with appropriate cleanup strategies.
+    Integrates with BlockSwapModelTracker for smart cleanup decisions.
     """
     try:
         tracking = model_patcher.attachments.get('blockswap_tracking')
         if tracking is None or tracking.cleanup_executed:
             return
+
+        # Get tracker for smart cleanup decisions
+        tracker = BlockSwapModelTracker.get_instance()
+        model_id = id(model_patcher.model)
+
+        # Get session_id from tracking if available
+        session_id = getattr(tracking, 'session_id', None)
+
+        # If no session, also check if tracker has this model
+        if session_id is None:
+            session_id = tracker.find_session_for_model(model_id)
+
+        # Check with tracker for cleanup decision
+        if session_id:
+            decision = tracker.get_cleanup_decision(model_id, session_id)
+
+            if decision == CleanupDecision.SKIP:
+                if getattr(tracking, 'block_swap_debug', False):
+                    print("[BlockSwap] Cleanup skipped (tracker decision)")
+                return
+
+            if decision == CleanupDecision.PRESERVE:
+                if getattr(tracking, 'block_swap_debug', False):
+                    print("[BlockSwap] Blocks preserved for next loop")
+                # Clear tracking state but DON'T move/delete blocks
+                _clear_callback_tracking(model_patcher)
+                return
 
         tracking.cleanup_executed = True
 
@@ -242,7 +275,31 @@ def cleanup_callback(model_patcher: Any) -> None:
             else:
                 print("[BlockSwap] Native: All swapped block references freed from memory")
 
+        # Mark cleanup done in tracker if session active
+        if session_id:
+            tracker.mark_cleanup_done(model_id, session_id)
+
     except Exception as e:
         print(f"[BlockSwap] CRITICAL ERROR in cleanup_callback: {str(e)}")
         import traceback
         traceback.print_exc()
+
+
+def _clear_callback_tracking(model_patcher: Any) -> None:
+    """Clear tracking state for preserve mode.
+
+    This is used when the tracker decides to PRESERVE blocks for subsequent
+    loops. We clear the tracking state but don't move or delete blocks.
+
+    Args:
+        model_patcher: The model patcher instance
+    """
+    tracking = model_patcher.attachments.get('blockswap_tracking')
+    if tracking is None:
+        return
+
+    tracking.cleanup_executed = True
+    tracking.swapped_indices.clear()
+    tracking.successfully_swapped_indices.clear()
+    tracking.failed_to_swap_indices.clear()
+    tracking.embeddings_offloaded.clear()
