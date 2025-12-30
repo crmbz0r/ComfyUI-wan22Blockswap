@@ -34,7 +34,7 @@ ComfyUI-Wan22Blockswap is a powerful ComfyUI node that implements advanced VRAM 
 
 ### Method 1: Manual Installation
 
-1. Download the latest release from the [Releases page](https://github.com/crmbz0r/ComfyUI-wan22Blockswap/releases)
+1. Download the latest release from the [Releases page](https://github.com/crmbz0r/ComfyUI_Wan22Blockswap/releases)
 2. Extract the contents to your ComfyUI custom nodes directory:
     ```
     ComfyUI/custom_nodes/ComfyUI-wan22Blockswap/

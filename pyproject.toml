@@ -5,10 +5,10 @@ version = "0.0.1"
 license = {file = "LICENSE"}
 
 [project.urls]
-Repository = "https://github.com/crmbz0r/ComfyUI-Wan22Blockswap"
+Repository = "https://github.com/crmbz0r/ComfyUI_Wan22Blockswap"
 #  Used by Comfy Registry https://comfyregistry.org
 
 [tool.comfy]
 PublisherId = "crmbz0r"
-DisplayName = "ComfyUI-Wan22Blockswap"
+DisplayName = "ComfyUI_Wan22Blockswap"
 Icon = ""
