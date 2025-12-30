@@ -7,13 +7,13 @@ block swapping system.
 
 import torch
 import gc
-from typing import Optional
+from typing import Any, Optional
 
 
 def log_debug(message: str, debug_enabled: bool = False) -> None:
     """
     Log debug messages if debug mode is enabled.
-    
+
     Args:
         message: The debug message to log
         debug_enabled: Whether debug logging is enabled
