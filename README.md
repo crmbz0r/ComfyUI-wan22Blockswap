@@ -37,6 +37,7 @@
 -   **Lazy Loading**: Blocks are loaded directly to their target device, preventing massive VRAM spikes
 -   **GGUF Compatible**: Automatically detects and handles GGUF quantized models with best-effort swapping
 -   **Multi-Model Support**: Works with all WAN model variants (1.3B, 5B, 14B, LongCat)
+-   **WanVideoLooper Integration**: Full support for multi-loop video generation workflows
 -   **VACE Integration**: Optional support for VACE model block swapping for multi-modal tasks
 -   **Smart Memory Management**: Automatic cleanup and memory optimization
 -   **Debug Support**: Comprehensive logging and performance monitoring
