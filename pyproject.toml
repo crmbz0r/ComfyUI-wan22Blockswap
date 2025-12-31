@@ -1,5 +1,5 @@
 [project]
-name = "Wan22Blockswap"
+name = "[EXPERIMENTAL] Wan22Blockswap"
 description = "This is an updated Wan 2.2 block swap node for ComfyUI native nodes, works by swapping upto 40 blocks to the CPU to reduce VRAM."
 version = "0.0.1"
 license = {file = "LICENSE"}

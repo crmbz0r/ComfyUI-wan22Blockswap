@@ -473,14 +473,36 @@ class WAN22BlockSwapLoader:
 
 class LazyModelPatcher:
     """
-    A wrapper that defers model loading until the model is actually accessed.
+    A wrapper that defers model loading until actual inference begins.
     
     This is used for low_noise models so they don't load until the sampler
     needs them (after high_noise model completes its passes).
     
-    The wrapper transparently proxies all attribute access to the real
-    ModelPatcher once it's loaded.
+    Key insight: ComfyUI and downstream nodes access .model and other attributes
+    during workflow setup. We must NOT trigger loading for these accesses.
+    Loading should ONLY happen when:
+    1. comfy.model_management loads the model to GPU for inference
+    2. The sampler actually calls methods on the model
+    
+    Strategy: Return placeholder/dummy values for introspection, and only
+    load when methods that require the actual model weights are called.
     """
+    
+    # Attributes that return placeholder values (don't trigger loading)
+    _INTROSPECTION_ATTRS = {
+        'model', 'model_options', 'is_clone', 'model_size',
+        'load_device', 'offload_device', 'current_device', 'model_dtype',
+        'patches', 'object_patches', 'object_patches_backup',
+        'weight_inplace_update', 'model_lowvram', 'lowvram_patch_counter',
+        'attachments',
+    }
+    
+    # Methods that trigger actual loading (inference-related)
+    _LOAD_TRIGGERS = {
+        'patch_model', 'unpatch_model', 'patch_model_lowvram', 
+        'calculate_weight', 'clone', 'add_patches', 'get_key_patches',
+        'model_state_dict', 'add_callback',
+    }
     
     def __init__(self, loader_func, loader_args: Dict[str, Any]):
         """
@@ -495,13 +517,22 @@ class LazyModelPatcher:
         object.__setattr__(self, '_loader_args', loader_args)
         object.__setattr__(self, '_real_patcher', None)
         object.__setattr__(self, '_loading', False)
+        object.__setattr__(self, '_load_triggered_by', None)
+        # Placeholder attributes for introspection
+        object.__setattr__(self, '_placeholder_model_options', {})
+        object.__setattr__(self, '_placeholder_attachments', {})
     
-    def _ensure_loaded(self):
+    def _ensure_loaded(self, trigger_name: str = "unknown"):
         """Load the model if not already loaded."""
         if self._real_patcher is None and not self._loading:
             object.__setattr__(self, '_loading', True)
+            object.__setattr__(self, '_load_triggered_by', trigger_name)
+            
+            model_name = self._loader_args.get('gguf_model') or self._loader_args.get('safetensors_model')
             logger.info("╔══════════════════════════════════════════════════════════════")
-            logger.info("║ LazyModelPatcher: Loading low_noise model (sampler requested it)")
+            logger.info(f"║ LazyModelPatcher: Loading low_noise model NOW")
+            logger.info(f"║ Model: {model_name}")
+            logger.info(f"║ Triggered by: {trigger_name}")
             logger.info("╚══════════════════════════════════════════════════════════════")
             
             try:
@@ -512,26 +543,90 @@ class LazyModelPatcher:
         
         return self._real_patcher
     
+    def _is_loaded(self) -> bool:
+        """Check if model is already loaded."""
+        return object.__getattribute__(self, '_real_patcher') is not None
+    
     def __getattr__(self, name):
-        """Proxy attribute access to real patcher, loading if needed."""
+        """Proxy attribute access, with smart loading deferral."""
         # Don't proxy private attributes
         if name.startswith('_'):
             raise AttributeError(f"'{type(self).__name__}' object has no attribute '{name}'")
         
-        patcher = self._ensure_loaded()
+        # Check if model already loaded - if so, always proxy
+        real_patcher = object.__getattribute__(self, '_real_patcher')
+        if real_patcher is not None:
+            return getattr(real_patcher, name)
+        
+        # ===== NOT LOADED YET - be careful about what triggers loading =====
+        
+        # Return placeholder values for introspection attributes
+        if name in LazyModelPatcher._INTROSPECTION_ATTRS:
+            if name == 'model':
+                # Return None - this is checked but not used until inference
+                return None
+            elif name == 'model_options':
+                return object.__getattribute__(self, '_placeholder_model_options')
+            elif name == 'attachments':
+                return object.__getattribute__(self, '_placeholder_attachments')
+            elif name == 'is_clone':
+                return False
+            elif name == 'model_size':
+                return 0  # Will be correct after loading
+            elif name in ('load_device', 'current_device'):
+                return torch.device('cpu')
+            elif name == 'offload_device':
+                return torch.device('cpu')
+            elif name == 'model_dtype':
+                return torch.bfloat16
+            elif name in ('patches', 'object_patches', 'object_patches_backup'):
+                return {}
+            elif name in ('weight_inplace_update', 'model_lowvram'):
+                return False
+            elif name == 'lowvram_patch_counter':
+                return 0
+            else:
+                return None
+        
+        # Trigger loading for inference-related methods
+        if name in LazyModelPatcher._LOAD_TRIGGERS:
+            patcher = self._ensure_loaded(trigger_name=f"method '{name}' called")
+            if patcher is None:
+                raise RuntimeError("Failed to load model")
+            return getattr(patcher, name)
+        
+        # For unknown attributes, trigger loading (safer default)
+        patcher = self._ensure_loaded(trigger_name=f"getattr('{name}')")
         if patcher is None:
             raise RuntimeError("Failed to load model")
         return getattr(patcher, name)
     
     def __setattr__(self, name, value):
-        """Proxy attribute setting to real patcher."""
+        """Proxy attribute setting, with loading deferral for safe attrs."""
         if name.startswith('_'):
             object.__setattr__(self, name, value)
-        else:
-            patcher = self._ensure_loaded()
-            if patcher is None:
-                raise RuntimeError("Failed to load model")
-            setattr(patcher, name, value)
+            return
+        
+        # Check if model already loaded
+        real_patcher = object.__getattribute__(self, '_real_patcher')
+        if real_patcher is not None:
+            setattr(real_patcher, name, value)
+            return
+        
+        # Allow setting model_options without loading (for BlockSwap info)
+        if name == 'model_options':
+            object.__setattr__(self, '_placeholder_model_options', value)
+            return
+        
+        if name == 'attachments':
+            object.__setattr__(self, '_placeholder_attachments', value)
+            return
+        
+        # Other setattr triggers loading
+        patcher = self._ensure_loaded(trigger_name=f"setattr('{name}')")
+        if patcher is None:
+            raise RuntimeError("Failed to load model")
+        setattr(patcher, name, value)
     
     def __repr__(self):
         if self._real_patcher is not None:

@@ -28,6 +28,8 @@ class BlockSwapTracker:
         self.embeddings_offloaded: Dict[str, Any] = {}  # Offloaded embeddings
         self.cleanup_executed: bool = False  # Whether cleanup was already done
         self.is_gguf_model: bool = False  # Whether model is GGUF quantized
+        self.block_swap_debug: bool = False  # Enable debug logging
+        self.session_id: Optional[str] = None  # Session ID for tracker
 
 
 class BlockManager:

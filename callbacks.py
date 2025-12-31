@@ -167,15 +167,18 @@ def cleanup_callback(model_patcher: Any) -> None:
 
         tracking.cleanup_executed = True
 
-        if tracking.block_swap_debug:
+        # Use getattr for safety in case attribute doesn't exist
+        debug_enabled = getattr(tracking, 'block_swap_debug', False)
+
+        if debug_enabled:
             print(f"[BlockSwap] ===== ON_CLEANUP CALLBACK EXECUTING =====")
 
         # Get model info
         base_model = model_patcher.model
-        is_gguf = tracking.is_gguf_model
-        successfully_swapped = tracking.successfully_swapped_indices
+        is_gguf = getattr(tracking, 'is_gguf_model', False)
+        successfully_swapped = getattr(tracking, 'successfully_swapped_indices', [])
 
-        if tracking.block_swap_debug:
+        if debug_enabled:
             print(f"[BlockSwap] Model type: {'GGUF' if is_gguf else 'Native'}")
             print(f"[BlockSwap] Successfully swapped blocks: {len(successfully_swapped)}")
 
@@ -184,15 +187,15 @@ def cleanup_callback(model_patcher: Any) -> None:
         main_device = torch.device("cuda")
 
         # Phase 1: Synchronize GPU before any block operations
-        if tracking.block_swap_debug:
+        if debug_enabled:
             print("[BlockSwap] Phase 1: Synchronizing GPU...")
-        sync_gpu(tracking.block_swap_debug)
+        sync_gpu(debug_enabled)
 
         # Phase 2: Handle block cleanup based on model type
         if unet is not None and hasattr(unet, "blocks") and len(successfully_swapped) > 0:
             if is_gguf:
                 # GGUF: Move blocks back to GPU (don't delete!)
-                if tracking.block_swap_debug:
+                if debug_enabled:
                     print("[BlockSwap] Phase 2 (GGUF): Moving blocks back to GPU")
 
                 moved_back = 0
@@ -206,10 +209,10 @@ def cleanup_callback(model_patcher: Any) -> None:
                             moved_back += 1
                     except Exception as e:
                         move_failures += 1
-                        if tracking.block_swap_debug:
+                        if debug_enabled:
                             print(f"[BlockSwap] Block {block_idx} move-back failed: {str(e)[:80]}")
 
-                if tracking.block_swap_debug:
+                if debug_enabled:
                     print(f"[BlockSwap] GGUF: Moved {moved_back}/{len(successfully_swapped)} blocks back to GPU")
                     if move_failures > 0:
                         print(f"[BlockSwap] GGUF: {move_failures} move-back failures (non-critical)")
@@ -219,7 +222,7 @@ def cleanup_callback(model_patcher: Any) -> None:
 
             else:
                 # NATIVE: Aggressive cleanup (delete references)
-                if tracking.block_swap_debug:
+                if debug_enabled:
                     print("[BlockSwap] Phase 2 (Native): Deleting swapped block references")
 
                 blocks_deleted = 0
@@ -229,25 +232,25 @@ def cleanup_callback(model_patcher: Any) -> None:
                             del tracking.swapped_blocks_refs[block_idx]
                             blocks_deleted += 1
                     except Exception as e:
-                        if tracking.block_swap_debug:
+                        if debug_enabled:
                             print(f"[BlockSwap] Failed to delete block {block_idx}: {str(e)[:80]}")
 
-                if tracking.block_swap_debug:
+                if debug_enabled:
                     print(f"[BlockSwap] Native: Deleted {blocks_deleted}/{len(successfully_swapped)} block references")
 
                 tracking.swapped_blocks_refs.clear()
 
         # Phase 3: Cleanup embeddings (same for both GGUF and Native)
-        if tracking.block_swap_debug:
+        if debug_enabled:
             print("[BlockSwap] Phase 3: Cleaning up embedding references")
 
         for emb_name in list(tracking.embeddings_offloaded.keys()):
             try:
                 del tracking.embeddings_offloaded[emb_name]
-                if tracking.block_swap_debug:
+                if debug_enabled:
                     print(f"[BlockSwap] Deleted embedding: {emb_name}")
             except Exception as e:
-                if tracking.block_swap_debug:
+                if debug_enabled:
                     print(f"[BlockSwap] Failed to delete embedding {emb_name}: {str(e)[:80]}")
 
         tracking.embeddings_offloaded.clear()
@@ -258,17 +261,16 @@ def cleanup_callback(model_patcher: Any) -> None:
         tracking.failed_to_swap_indices.clear()
 
         # Phase 5: Garbage collection
-        if tracking.block_swap_debug:
+        if debug_enabled:
             print("[BlockSwap] Phase 5: Running garbage collection")
-        gc.collect()
         gc.collect()
 
         # Phase 6: Clear device caches (AFTER operations complete)
-        if tracking.block_swap_debug:
+        if debug_enabled:
             print("[BlockSwap] Phase 6: Clearing device caches")
-        clear_device_caches(tracking.block_swap_debug)
+        clear_device_caches(debug_enabled)
 
-        if tracking.block_swap_debug:
+        if debug_enabled:
             print("[BlockSwap] ===== ON_CLEANUP COMPLETE =====")
             if is_gguf:
                 print("[BlockSwap] GGUF: Blocks moved back to GPU safely (no deletion)")
@@ -277,7 +279,7 @@ def cleanup_callback(model_patcher: Any) -> None:
 
         # Mark cleanup done in tracker if session active
         if session_id:
-            tracker.mark_cleanup_done(model_id, session_id)
+            tracker.mark_cleanup_done(model_patcher)
 
     except Exception as e:
         print(f"[BlockSwap] CRITICAL ERROR in cleanup_callback: {str(e)}")
