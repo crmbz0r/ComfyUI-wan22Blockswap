@@ -35,7 +35,11 @@ from .looper_helpers import (
     cleanup_loop_blockswap,
     validate_tensor_consistency,
     reset_model_blockswap_state,
+    start_blockswap_session,
+    end_blockswap_session,
+    update_session_loop_state,
 )
+from .model_tracker import BlockSwapModelTracker, CleanupMode, CleanupDecision
 
 
 class WAN22BlockSwapLooper:
@@ -170,6 +174,7 @@ class WAN22BlockSwapLooper:
 
         This function processes the input models list and applies loop-aware BlockSwap
         configuration to each model, ensuring proper state isolation between loop iterations.
+        It creates a session to track models across loops and prevent premature cleanup.
 
         Args:
             models_list (Any): List or tuple of models from WanVideoLooper or
@@ -184,7 +189,7 @@ class WAN22BlockSwapLooper:
             block_swap_debug (bool): Enable performance monitoring
 
         Returns:
-            Tuple containing the prepared models list compatible with WanVideoLooper
+            Tuple containing a dict with 'models' list and 'session_id' for downstream use
 
         Raises:
             ValueError: If models_list is not a valid iterable or is empty
@@ -197,53 +202,81 @@ class WAN22BlockSwapLooper:
         if not models_list:
             raise ValueError("models_list cannot be empty")
 
+        # Determine expected loop count based on input structure
+        expected_loops = len(models_list)
+
         if block_swap_debug:
-            print(f"[BlockSwap] ===== WAN22BlockSwapLooper: Preparing {len(models_list)} models =====")
+            print(f"[BlockSwap] ===== WAN22BlockSwapLooper: Preparing {expected_loops} models =====")
+
+        # Start a tracking session for this looper workflow
+        session_id = start_blockswap_session(expected_loops, block_swap_debug)
+
+        if block_swap_debug:
+            print(f"[BlockSwap] Session started: {session_id}")
 
         # Process models based on input type
         prepared_models = []
 
-        for i, model_item in enumerate(models_list):
+        try:
+            for i, model_item in enumerate(models_list):
+                if block_swap_debug:
+                    print(f"[BlockSwap] Processing model {i+1}/{len(models_list)}")
+
+                # Handle different input formats
+                if isinstance(model_item, (list, tuple)) and len(model_item) == 3:
+                    # WanVideoLoraSequencer format: (model_high, model_low, clip)
+                    model_high, model_low, clip = model_item
+
+                    # Prepare high-noise model with session tracking
+                    prepared_high = prepare_model_for_loop(
+                        model_high, i, blocks_to_swap, offload_txt_emb, offload_img_emb,
+                        use_non_blocking, vace_blocks_to_swap, prefetch_blocks, block_swap_debug,
+                        session_id=session_id
+                    )
+
+                    # Prepare low-noise model with session tracking
+                    prepared_low = prepare_model_for_loop(
+                        model_low, i, blocks_to_swap, offload_txt_emb, offload_img_emb,
+                        use_non_blocking, vace_blocks_to_swap, prefetch_blocks, block_swap_debug,
+                        session_id=session_id
+                    )
+
+                    prepared_models.append((prepared_high, prepared_low, clip))
+
+                    if block_swap_debug:
+                        print(f"[BlockSwap] Looper: Prepared segment {i+1} with high/low models")
+
+                else:
+                    # Single model format (from WanVideoLooper)
+                    prepared_model = prepare_model_for_loop(
+                        model_item, i, blocks_to_swap, offload_txt_emb, offload_img_emb,
+                        use_non_blocking, vace_blocks_to_swap, prefetch_blocks, block_swap_debug,
+                        session_id=session_id
+                    )
+                    prepared_models.append(prepared_model)
+
+                    if block_swap_debug:
+                        print(f"[BlockSwap] Looper: Prepared model {i+1}")
+
             if block_swap_debug:
-                print(f"[BlockSwap] Processing model {i+1}/{len(models_list)}")
+                print(f"[BlockSwap] ===== WAN22BlockSwapLooper: Preparation complete =====")
+                tracker = BlockSwapModelTracker.get_instance()
+                stats = tracker.get_session_stats(session_id)
+                print(f"[BlockSwap] Session stats: {stats}")
 
-            # Handle different input formats
-            if isinstance(model_item, (list, tuple)) and len(model_item) == 3:
-                # WanVideoLoraSequencer format: (model_high, model_low, clip)
-                model_high, model_low, clip = model_item
+        except Exception as e:
+            # Clean up session on error
+            if block_swap_debug:
+                print(f"[BlockSwap] Error during preparation: {e}")
+            end_blockswap_session(session_id, block_swap_debug)
+            raise
 
-                # Prepare high-noise model
-                prepared_high = prepare_model_for_loop(
-                    model_high, i, blocks_to_swap, offload_txt_emb, offload_img_emb,
-                    use_non_blocking, vace_blocks_to_swap, prefetch_blocks, block_swap_debug
-                )
-
-                # Prepare low-noise model
-                prepared_low = prepare_model_for_loop(
-                    model_low, i, blocks_to_swap, offload_txt_emb, offload_img_emb,
-                    use_non_blocking, vace_blocks_to_swap, prefetch_blocks, block_swap_debug
-                )
-
-                prepared_models.append((prepared_high, prepared_low, clip))
-
-                if block_swap_debug:
-                    print(f"[BlockSwap] Looper: Prepared segment {i+1} with high/low models")
-
-            else:
-                # Single model format (from WanVideoLooper)
-                prepared_model = prepare_model_for_loop(
-                    model_item, i, blocks_to_swap, offload_txt_emb, offload_img_emb,
-                    use_non_blocking, vace_blocks_to_swap, prefetch_blocks, block_swap_debug
-                )
-                prepared_models.append(prepared_model)
-
-                if block_swap_debug:
-                    print(f"[BlockSwap] Looper: Prepared model {i+1}")
-
-        if block_swap_debug:
-            print(f"[BlockSwap] ===== WAN22BlockSwapLooper: Preparation complete =====")
-
-        return (prepared_models,)
+        # Return both models and session_id for downstream use
+        return ({
+            "models": prepared_models,
+            "session_id": session_id,
+            "expected_loops": expected_loops,
+        },)
 
 
 # Node registration

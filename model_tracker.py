@@ -214,6 +214,20 @@ class BlockSwapModelTracker:
         with self._model_lock:
             return model_id in self._model_states
 
+    def find_session_for_model(self, model_id: int) -> Optional[str]:
+        """Find the session ID that a model belongs to.
+
+        Args:
+            model_id: The id() of the model's underlying model object.
+
+        Returns:
+            The session_id if found, None otherwise.
+        """
+        with self._model_lock:
+            if model_id in self._model_states:
+                return self._model_states[model_id].session_id
+        return None
+
     def increment_ref(self, model: Any) -> None:
         """Increment reference count for a model."""
         model_id = id(model.model)

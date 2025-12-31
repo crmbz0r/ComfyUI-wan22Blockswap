@@ -25,7 +25,7 @@ class BlockSwapConfig:
                     "MODEL",
                     {
                         "tooltip": "ComfyUI native WAN model "
-                        "(WAN 2.1/2.2/2.6, etc.) - Supports both native and GGUF models"
+                        "(WAN 2.1/2.2, possibly 2.6 when released, etc.) - Supports both native and GGUF models"
                     },
                 ),
                 "blocks_to_swap": (

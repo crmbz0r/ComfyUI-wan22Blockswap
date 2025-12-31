@@ -149,9 +149,9 @@ def cleanup_callback(model_patcher: Any) -> None:
         if session_id is None:
             session_id = tracker.find_session_for_model(model_id)
 
-        # Check with tracker for cleanup decision
+        # Check with tracker for cleanup decision (pass model_patcher, not model_id)
         if session_id:
-            decision = tracker.get_cleanup_decision(model_id, session_id)
+            decision = tracker.get_cleanup_decision(model_patcher)
 
             if decision == CleanupDecision.SKIP:
                 if getattr(tracking, 'block_swap_debug', False):

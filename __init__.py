@@ -3,11 +3,26 @@
 This module imports and exports all the components of the block swapping
 system, making them available when the package is imported. It provides
 a clean interface for accessing the functionality.
+
+Includes:
+- wan22BlockSwap: Dynamic block swapping via ON_LOAD callbacks
+- WAN22BlockSwapLoader: Loader with integrated pre-routing (prevents VRAM spikes)
+- WAN22BlockSwapLooper: Multi-loop integration node
 """
 
-from .nodes import NODE_CLASS_MAPPINGS, NODE_DISPLAY_NAME_MAPPINGS
+from .nodes import NODE_CLASS_MAPPINGS as _NODES_MAPPINGS
+from .nodes import NODE_DISPLAY_NAME_MAPPINGS as _NODES_DISPLAY_MAPPINGS
+from .blockswap_loader import (
+    NODE_CLASS_MAPPINGS as _LOADER_MAPPINGS,
+    NODE_DISPLAY_NAME_MAPPINGS as _LOADER_DISPLAY_MAPPINGS,
+    WAN22BlockSwapLoader,
+)
 from .blockswap_looper import WAN22BlockSwapLooper
 from .config import BlockSwapConfig
+
+# Merge node mappings from all modules
+NODE_CLASS_MAPPINGS = {**_NODES_MAPPINGS, **_LOADER_MAPPINGS}
+NODE_DISPLAY_NAME_MAPPINGS = {**_NODES_DISPLAY_MAPPINGS, **_LOADER_DISPLAY_MAPPINGS}
 from .block_manager import BlockManager, BlockSwapTracker
 from .callbacks import lazy_load_callback, cleanup_callback
 from .utils import log_debug, sync_gpu, clear_device_caches
@@ -32,6 +47,7 @@ from .looper_helpers import (
 __all__ = [
     "NODE_CLASS_MAPPINGS",           # ComfyUI node registration mappings
     "NODE_DISPLAY_NAME_MAPPINGS",    # ComfyUI node display names
+    "WAN22BlockSwapLoader",          # NEW: Loader with integrated pre-routing
     "WAN22BlockSwapLooper",          # Specialized looper node for multi-loop integration
     "BlockSwapConfig",               # Configuration and input type definitions
     "BlockManager",                  # Core block swapping operations

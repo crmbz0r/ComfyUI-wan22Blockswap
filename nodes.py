@@ -67,6 +67,11 @@ class WanVideo22BlockSwap:
         strategy: keeps early blocks on GPU (where most computation happens)
         and moves later blocks to CPU (where activations can be staged).
 
+        Pre-routed Detection:
+        If the model was loaded via WAN22BlockSwapLoader, blocks are already
+        routed to their target devices. This function detects that case and
+        skips redundant operations, only registering cleanup callbacks.
+
         Args:
             model (ModelPatcher): The ComfyUI model patcher instance.
             blocks_to_swap (int): Number of transformer blocks to swap.
@@ -83,23 +88,43 @@ class WanVideo22BlockSwap:
 
         Returns:
             tuple: Modified model patcher with block swap callback registered.
-
-        Notes:
-            - The callback is triggered on model load (CallbacksMP.ON_LOAD)
-            - Block swap direction: LAST N blocks → CPU (not first N)
-            - Early blocks remain on GPU where most computation occurs
-            - Memory savings: ~100-200MB per 10 blocks swapped
-            - Performance impact: varies with block prefetching settings
-            - GGUF models: Best-effort swapping with graceful error handling
-
-        Apply lazy loading block swapping - offloads DURING loading.
-
-        Strategy:
-        1. Hijack the model loading process
-        2. As each block loads, immediately route to target device
-        3. Prevents VRAM spike from full model load
-        4. GPU only sees the blocks it needs to keep
         """
+        # Check if model was loaded with pre-routing from WAN22BlockSwapLoader
+        model_options = getattr(model, "model_options", {}) or {}
+        blockswap_info = model_options.get("wan22_blockswap_info", {})
+        
+        if blockswap_info.get("pre_routed", False):
+            # Model already has blocks pre-routed during load
+            pre_routed_blocks = blockswap_info.get("blocks_to_swap", 0)
+            total_blocks = blockswap_info.get("total_blocks", 30)
+            
+            if pre_routed_blocks >= blocks_to_swap:
+                # No additional swapping needed - blocks already on correct devices
+                if block_swap_debug:
+                    print(f"[BlockSwap] Model pre-routed with {pre_routed_blocks} swap blocks")
+                    print(f"[BlockSwap] Requested {blocks_to_swap} blocks - skipping redundant swap")
+                    print(f"[BlockSwap] Registering cleanup callback only")
+                
+                # Clone and register only cleanup callback
+                model_copy = model.clone()
+                model_copy.add_callback(CallbacksMP.ON_CLEANUP, cleanup_callback)
+                
+                # Store info that we detected pre-routing
+                if not hasattr(model_copy, "model_options"):
+                    model_copy.model_options = {}
+                model_copy.model_options["wan22_blockswap_detected_preroute"] = True
+                
+                return (model_copy,)
+            else:
+                # Need to swap additional blocks beyond what was pre-routed
+                additional_blocks = blocks_to_swap - pre_routed_blocks
+                if block_swap_debug:
+                    print(f"[BlockSwap] Model pre-routed with {pre_routed_blocks} swap blocks")
+                    print(f"[BlockSwap] Requested {blocks_to_swap} - swapping {additional_blocks} additional blocks")
+                
+                # Adjust blocks_to_swap for the callback
+                # The callback should only move blocks that aren't already on CPU
+                blocks_to_swap = additional_blocks
 
         def lazy_load_callback_wrapper(
             model_patcher: ModelPatcher,
