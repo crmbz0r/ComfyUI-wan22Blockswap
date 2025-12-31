@@ -30,6 +30,7 @@ class BlockSwapTracker:
         self.is_gguf_model: bool = False  # Whether model is GGUF quantized
         self.block_swap_debug: bool = False  # Enable debug logging
         self.session_id: Optional[str] = None  # Session ID for tracker
+        self.blocks_restored: bool = False  # Whether blocks were restored to GPU (pre-unpatch)
 
 
 class BlockManager:

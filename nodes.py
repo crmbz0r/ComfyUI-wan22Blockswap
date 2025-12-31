@@ -35,7 +35,7 @@ class WanVideo22BlockSwap:
 
     RETURN_TYPES: tuple = ("MODEL",)
     RETURN_NAMES: tuple = ("model",)
-    CATEGORY: str = "ComfyUI-wan22Blockswap"
+    CATEGORY: str = "ComfyUI_Wan22Blockswap"
     FUNCTION: str = "apply_block_swap"
     DESCRIPTION: str = (
         "Apply LAZY LOADING block swapping to WAN 2.1/2.2 models. "

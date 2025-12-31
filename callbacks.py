@@ -124,6 +124,74 @@ def lazy_load_callback(
     if block_swap_debug:
         print(f"[BlockSwap] Block tracking attached for ON_CLEANUP callback")
         print(f"[BlockSwap] Tracking {len(blockswap_tracking.swapped_indices)} swapped blocks")
+    
+    # CRITICAL: Wrap unpatch_model to restore blocks BEFORE unpatching
+    # This prevents "CUDA error: invalid argument" when moving partially-offloaded GGUF models
+    _wrap_unpatch_model(model_patcher, block_swap_debug)
+
+
+def _wrap_unpatch_model(model_patcher: Any, block_swap_debug: bool = False) -> None:
+    """
+    Wrap the model patcher's unpatch_model method to restore blocks first.
+    
+    When ComfyUI unloads a model (to free VRAM for another model), it calls
+    unpatch_model which tries to move the ENTIRE model to CPU. But BlockSwap
+    has already moved some blocks to CPU, and GGUF tensors fail when you try
+    to move them to CPU when they're already on CPU.
+    
+    This wrapper restores all swapped blocks to GPU BEFORE unpatch_model runs,
+    ensuring the model is in a consistent state.
+    """
+    # Store the original method
+    original_unpatch = model_patcher.unpatch_model
+    
+    def wrapped_unpatch_model(device_to=None, unpatch_weights=True):
+        """Restore blocks to GPU before unpatching."""
+        tracking = model_patcher.attachments.get('blockswap_tracking')
+        
+        if tracking is not None and not getattr(tracking, 'blocks_restored', False):
+            successfully_swapped = getattr(tracking, 'successfully_swapped_indices', [])
+            is_gguf = getattr(tracking, 'is_gguf_model', False)
+            
+            if len(successfully_swapped) > 0:
+                if block_swap_debug:
+                    print(f"[BlockSwap] PRE-UNPATCH: Restoring {len(successfully_swapped)} blocks to GPU")
+                
+                # Get the UNet
+                base_model = model_patcher.model
+                unet = BlockManager.get_unet_from_model(base_model)
+                
+                if unet is not None and hasattr(unet, 'blocks'):
+                    main_device = torch.device('cuda')
+                    restored = 0
+                    
+                    for block_idx in successfully_swapped:
+                        try:
+                            if block_idx < len(unet.blocks):
+                                # Move block back to GPU before unpatch
+                                unet.blocks[block_idx].to(main_device, non_blocking=False)
+                                restored += 1
+                        except Exception as e:
+                            if block_swap_debug:
+                                print(f"[BlockSwap] PRE-UNPATCH: Block {block_idx} restore failed: {str(e)[:50]}")
+                    
+                    if block_swap_debug:
+                        print(f"[BlockSwap] PRE-UNPATCH: Restored {restored}/{len(successfully_swapped)} blocks to GPU")
+                    
+                    # Sync to ensure all moves complete
+                    torch.cuda.synchronize()
+                
+                # Mark as restored so we don't do this twice
+                tracking.blocks_restored = True
+        
+        # Call original unpatch method
+        return original_unpatch(device_to=device_to, unpatch_weights=unpatch_weights)
+    
+    # Replace the method
+    model_patcher.unpatch_model = wrapped_unpatch_model
+    
+    if block_swap_debug:
+        print("[BlockSwap] Wrapped unpatch_model for safe GGUF unloading")
 
 
 def cleanup_callback(model_patcher: Any) -> None:

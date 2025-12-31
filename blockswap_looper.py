@@ -1,22 +1,18 @@
-"""Specialized looper node for WAN 2.2 BlockSwap integration with WanVideoLooper.
+"""Specialized looper nodes for WAN 2.2 BlockSwap integration with WanVideoLooper.
 
-This module provides a loop-aware BlockSwap node that integrates with WanVideoLooper's
-multi-loop architecture. It addresses the 5 root causes of degraded output quality on
-subsequent loops by implementing proper state management, cleanup, and tensor validation.
+This module provides loop-aware BlockSwap nodes that integrate with WanVideoLooper's
+multi-loop architecture. It addresses issues with model state pollution across
+loops by implementing proper state management, cleanup, and tensor validation.
 
 Key Features:
 - Loop-aware model preparation with fresh callback registration
 - Between-loop cleanup with explicit block restoration
-- Tensor consistency validation for color matching chains
 - Compatibility with WanVideoLoraSequencer for per-segment variations
 - Comprehensive error handling and debug logging
 
-Root Causes Addressed:
-1. Model state pollution across loops
-2. Callback double-execution and cleanup flag issues
-3. Block state leakage between iterations
-4. Tensor device/dtype misalignment
-5. Embeddings persistence
+Integration Nodes:
+- WAN22BlockSwapLooperModels: Applies BlockSwap to model_high/model_low pair
+- WAN22BlockSwapSequencer: Applies BlockSwap to WanVideoLoraSequencer output
 """
 
 import torch
@@ -42,34 +38,40 @@ from .looper_helpers import (
 from .model_tracker import BlockSwapModelTracker, CleanupMode, CleanupDecision
 
 
-class WAN22BlockSwapLooper:
+class WAN22BlockSwapLooperModels:
     """
-    Specialized looper node that integrates BlockSwap with WanVideoLooper's multi-loop architecture.
+    Apply BlockSwap to model_high and model_low for WanVideoLooper integration.
 
-    This node manages BlockSwap state per loop iteration, preventing model state pollution,
-    callback state leakage, and tensor misalignment across subsequent video generation loops.
+    This node takes the model_high and model_low that would normally go directly
+    to WanVideoLooper and applies BlockSwap configuration to both. The output
+    models are fully compatible with WanVideoLooper's inputs.
 
-    The implementation creates fresh BlockSwap state for each loop iteration and ensures
-    proper cleanup between iterations, addressing the 5 identified root causes of degraded
-    output quality on subsequent loops.
+    Use this node when you're NOT using WanVideoLoraSequencer - it handles
+    the base high/low model pair.
 
-    Integration Points:
-    - Works with WanVideoLooperPrompts (no changes needed)
-    - Works with WanVideoLoraSequencer for per-segment model variations
-    - Returns compatible model format for WanVideoLooper
+    Workflow:
+    1. Load models with WAN22BlockSwapLoader (or standard loader)
+    2. Connect to this node to apply BlockSwap callbacks
+    3. Connect outputs to WanVideoLooper's model_high/model_low inputs
     """
 
     @classmethod
     def INPUT_TYPES(cls) -> Dict[str, Any]:
-        """Get input types for the WAN22BlockSwapLooper node."""
+        """Get input types for the WAN22BlockSwapLooperModels node."""
         return {
             "required": {
-                "models_list": (
-                    "ANY",
+                "model_high": (
+                    "MODEL",
                     {
-                        "tooltip": "List or tuple of models from WanVideoLooper or WanVideoLoraSequencer. "
-                        "Can be a single model list, or a list of (model_high, model_low, clip) tuples "
-                        "from WanVideoLoraSequencer."
+                        "tooltip": "The high-noise model to apply BlockSwap to. "
+                        "Will be used for early sampling steps in WanVideoLooper."
+                    },
+                ),
+                "model_low": (
+                    "MODEL",
+                    {
+                        "tooltip": "The low-noise model to apply BlockSwap to. "
+                        "Will be used for later sampling steps in WanVideoLooper."
                     },
                 ),
                 "blocks_to_swap": (
@@ -79,8 +81,8 @@ class WAN22BlockSwapLooper:
                         "min": 0,
                         "max": 48,
                         "step": 1,
-                        "tooltip": "Number of transformer blocks to swap to CPU per loop iteration. "
-                        "1.3B/5B models: 30 blocks, 14B model: 40 blocks, LongCat: 48 blocks",
+                        "tooltip": "Number of transformer blocks to swap to CPU. "
+                        "1.3B/5B: 30 blocks, 14B: 40 blocks, LongCat: 48 blocks",
                     },
                 ),
                 "offload_txt_emb": (
@@ -116,8 +118,7 @@ class WAN22BlockSwapLooper:
                         "min": 0,
                         "max": 15,
                         "step": 1,
-                        "tooltip": "VACE model blocks to swap (0 = auto, "
-                        "1-15 = specific count). "
+                        "tooltip": "VACE model blocks to swap (0 = auto). "
                         "VACE model has 15 blocks total",
                     },
                 ),
@@ -130,8 +131,7 @@ class WAN22BlockSwapLooper:
                         "step": 1,
                         "tooltip": "Prefetch N blocks ahead for performance. "
                         "Value of 1 usually sufficient to offset "
-                        "speed loss from swapping. "
-                        "Use debug mode to find optimal value",
+                        "speed loss from swapping.",
                     },
                 ),
                 "block_swap_debug": (
@@ -145,22 +145,21 @@ class WAN22BlockSwapLooper:
             },
         }
 
-    RETURN_TYPES: tuple = ("ANY",)
-    RETURN_NAMES: tuple = ("prepared_models",)
-    CATEGORY: str = "ComfyUI-wan22Blockswap/looper"
-    FUNCTION: str = "prepare_looper_models"
+    RETURN_TYPES: tuple = ("MODEL", "MODEL")
+    RETURN_NAMES: tuple = ("model_high", "model_low")
+    CATEGORY: str = "ComfyUI_Wan22Blockswap/looper"
+    FUNCTION: str = "apply_blockswap_to_models"
     DESCRIPTION: str = (
-        "Prepare models for WanVideoLooper with loop-aware BlockSwap integration. "
-        "This node integrates BlockSwap with WanVideoLooper's multi-loop architecture, "
-        "preventing model state pollution, callback state leakage, and tensor "
-        "misalignment across subsequent video generation loops. "
-        "Ensures consistent output quality across all loops by managing BlockSwap "
-        "state per iteration with proper cleanup and validation."
+        "Apply BlockSwap to high/low noise model pair for WanVideoLooper. "
+        "This node applies BlockSwap callbacks to both models, ensuring proper "
+        "VRAM management during WanVideoLooper's multi-step sampling. "
+        "Connect outputs directly to WanVideoLooper's model_high/model_low inputs."
     )
 
-    def prepare_looper_models(
+    def apply_blockswap_to_models(
         self,
-        models_list: Any,
+        model_high: ModelPatcher,
+        model_low: ModelPatcher,
         blocks_to_swap: int,
         offload_txt_emb: bool,
         offload_img_emb: bool,
@@ -168,122 +167,322 @@ class WAN22BlockSwapLooper:
         vace_blocks_to_swap: int = 0,
         prefetch_blocks: int = 0,
         block_swap_debug: bool = False,
-    ) -> Tuple[Any]:
+    ) -> Tuple[ModelPatcher, ModelPatcher]:
         """
-        Prepare models for WanVideoLooper with loop-aware BlockSwap configuration.
-
-        This function processes the input models list and applies loop-aware BlockSwap
-        configuration to each model, ensuring proper state isolation between loop iterations.
-        It creates a session to track models across loops and prevent premature cleanup.
+        Apply BlockSwap to high/low noise models for WanVideoLooper.
 
         Args:
-            models_list (Any): List or tuple of models from WanVideoLooper or
-                WanVideoLoraSequencer. Can be a single model list, or a list of
-                (model_high, model_low, clip) tuples from WanVideoLoraSequencer.
-            blocks_to_swap (int): Number of transformer blocks to swap to CPU
-            offload_txt_emb (bool): Whether to offload text embeddings to CPU
-            offload_img_emb (bool): Whether to offload image embeddings (I2V)
-            use_non_blocking (bool): Use non-blocking transfers for speed
-            vace_blocks_to_swap (int): VACE blocks to swap (0=auto detection)
-            prefetch_blocks (int): Blocks to prefetch ahead for pipeline
-            block_swap_debug (bool): Enable performance monitoring
+            model_high: The high-noise model
+            model_low: The low-noise model
+            blocks_to_swap: Number of transformer blocks to swap to CPU
+            offload_txt_emb: Whether to offload text embeddings
+            offload_img_emb: Whether to offload image embeddings
+            use_non_blocking: Use non-blocking memory transfers
+            vace_blocks_to_swap: VACE blocks to swap (0=auto)
+            prefetch_blocks: Blocks to prefetch ahead
+            block_swap_debug: Enable debug logging
 
         Returns:
-            Tuple containing a dict with 'models' list and 'session_id' for downstream use
-
-        Raises:
-            ValueError: If models_list is not a valid iterable or is empty
-            TypeError: If models_list contains invalid model types
+            Tuple of (model_high, model_low) with BlockSwap applied
         """
-        # Input validation
-        if not hasattr(models_list, '__iter__') or isinstance(models_list, (str, bytes)):
-            raise ValueError("models_list must be a list, tuple, or other iterable of models")
-
-        if not models_list:
-            raise ValueError("models_list cannot be empty")
-
-        # Determine expected loop count based on input structure
-        expected_loops = len(models_list)
-
         if block_swap_debug:
-            print(f"[BlockSwap] ===== WAN22BlockSwapLooper: Preparing {expected_loops} models =====")
+            print("[BlockSwap] ===== WAN22BlockSwapLooperModels: Applying BlockSwap =====")
+            print(f"[BlockSwap] blocks_to_swap: {blocks_to_swap}")
+            print(f"[BlockSwap] offload_txt_emb: {offload_txt_emb}, offload_img_emb: {offload_img_emb}")
 
-        # Start a tracking session for this looper workflow
-        session_id = start_blockswap_session(expected_loops, block_swap_debug)
+        # Start a session for this pair (2 models expected)
+        session_id = start_blockswap_session(loop_count=2, block_swap_debug=block_swap_debug)
 
         if block_swap_debug:
             print(f"[BlockSwap] Session started: {session_id}")
 
-        # Process models based on input type
-        prepared_models = []
-
         try:
-            for i, model_item in enumerate(models_list):
-                if block_swap_debug:
-                    print(f"[BlockSwap] Processing model {i+1}/{len(models_list)}")
-
-                # Handle different input formats
-                if isinstance(model_item, (list, tuple)) and len(model_item) == 3:
-                    # WanVideoLoraSequencer format: (model_high, model_low, clip)
-                    model_high, model_low, clip = model_item
-
-                    # Prepare high-noise model with session tracking
-                    prepared_high = prepare_model_for_loop(
-                        model_high, i, blocks_to_swap, offload_txt_emb, offload_img_emb,
-                        use_non_blocking, vace_blocks_to_swap, prefetch_blocks, block_swap_debug,
-                        session_id=session_id
-                    )
-
-                    # Prepare low-noise model with session tracking
-                    prepared_low = prepare_model_for_loop(
-                        model_low, i, blocks_to_swap, offload_txt_emb, offload_img_emb,
-                        use_non_blocking, vace_blocks_to_swap, prefetch_blocks, block_swap_debug,
-                        session_id=session_id
-                    )
-
-                    prepared_models.append((prepared_high, prepared_low, clip))
-
-                    if block_swap_debug:
-                        print(f"[BlockSwap] Looper: Prepared segment {i+1} with high/low models")
-
-                else:
-                    # Single model format (from WanVideoLooper)
-                    prepared_model = prepare_model_for_loop(
-                        model_item, i, blocks_to_swap, offload_txt_emb, offload_img_emb,
-                        use_non_blocking, vace_blocks_to_swap, prefetch_blocks, block_swap_debug,
-                        session_id=session_id
-                    )
-                    prepared_models.append(prepared_model)
-
-                    if block_swap_debug:
-                        print(f"[BlockSwap] Looper: Prepared model {i+1}")
+            # Prepare high-noise model (loop_index=0)
+            prepared_high = prepare_model_for_loop(
+                model=model_high,
+                loop_index=0,
+                blocks_to_swap=blocks_to_swap,
+                offload_txt_emb=offload_txt_emb,
+                offload_img_emb=offload_img_emb,
+                use_non_blocking=use_non_blocking,
+                vace_blocks_to_swap=vace_blocks_to_swap,
+                prefetch_blocks=prefetch_blocks,
+                block_swap_debug=block_swap_debug,
+                session_id=session_id,
+            )
 
             if block_swap_debug:
-                print(f"[BlockSwap] ===== WAN22BlockSwapLooper: Preparation complete =====")
-                tracker = BlockSwapModelTracker.get_instance()
-                stats = tracker.get_session_stats(session_id)
-                print(f"[BlockSwap] Session stats: {stats}")
+                print("[BlockSwap] High-noise model prepared with BlockSwap callbacks")
+
+            # Prepare low-noise model (loop_index=1)
+            prepared_low = prepare_model_for_loop(
+                model=model_low,
+                loop_index=1,
+                blocks_to_swap=blocks_to_swap,
+                offload_txt_emb=offload_txt_emb,
+                offload_img_emb=offload_img_emb,
+                use_non_blocking=use_non_blocking,
+                vace_blocks_to_swap=vace_blocks_to_swap,
+                prefetch_blocks=prefetch_blocks,
+                block_swap_debug=block_swap_debug,
+                session_id=session_id,
+            )
+
+            if block_swap_debug:
+                print("[BlockSwap] Low-noise model prepared with BlockSwap callbacks")
+                print("[BlockSwap] ===== WAN22BlockSwapLooperModels: Complete =====")
 
         except Exception as e:
-            # Clean up session on error
             if block_swap_debug:
-                print(f"[BlockSwap] Error during preparation: {e}")
+                print(f"[BlockSwap] Error during model preparation: {e}")
             end_blockswap_session(session_id, block_swap_debug)
             raise
 
-        # Return both models and session_id for downstream use
-        return ({
-            "models": prepared_models,
-            "session_id": session_id,
-            "expected_loops": expected_loops,
-        },)
+        return (prepared_high, prepared_low)
+
+
+class WAN22BlockSwapSequencer:
+    """
+    Apply BlockSwap to WanVideoLoraSequencer output for per-segment BlockSwap.
+
+    This node takes the output from WanVideoLoraSequencer (a list of model tuples)
+    and applies BlockSwap to each model. The output is compatible with
+    WanVideoLooper's model_clip_sequence input.
+
+    Use this when using WanVideoLoraSequencer to have different LoRAs per segment.
+
+    Workflow:
+    1. Load models with WAN22BlockSwapLoader (or standard loader)
+    2. Use WanVideoLoraSequencer to assign per-segment LoRAs
+    3. Connect sequencer output to this node
+    4. Connect this node's output to WanVideoLooper's model_clip_sequence
+    """
+
+    @classmethod
+    def INPUT_TYPES(cls) -> Dict[str, Any]:
+        """Get input types for the WAN22BlockSwapSequencer node."""
+        return {
+            "required": {
+                "model_clip_sequence": (
+                    "ANY",
+                    {
+                        "tooltip": "Connect the output from WanVideoLoraSequencer. "
+                        "This is a list of (model_high, model_low, clip) tuples."
+                    },
+                ),
+                "blocks_to_swap": (
+                    "INT",
+                    {
+                        "default": 20,
+                        "min": 0,
+                        "max": 48,
+                        "step": 1,
+                        "tooltip": "Number of transformer blocks to swap to CPU. "
+                        "1.3B/5B: 30 blocks, 14B: 40 blocks, LongCat: 48 blocks",
+                    },
+                ),
+                "offload_txt_emb": (
+                    "BOOLEAN",
+                    {
+                        "default": False,
+                        "tooltip": "Offload text_embedding to CPU. "
+                        "Reduces VRAM by ~500MB",
+                    },
+                ),
+                "offload_img_emb": (
+                    "BOOLEAN",
+                    {
+                        "default": False,
+                        "tooltip": "Offload img_emb to CPU (I2V models only). "
+                        "Reduces VRAM by ~200MB",
+                    },
+                ),
+            },
+            "optional": {
+                "use_non_blocking": (
+                    "BOOLEAN",
+                    {
+                        "default": False,
+                        "tooltip": "Use non-blocking memory transfers.",
+                    },
+                ),
+                "vace_blocks_to_swap": (
+                    "INT",
+                    {
+                        "default": 0,
+                        "min": 0,
+                        "max": 15,
+                        "step": 1,
+                        "tooltip": "VACE model blocks to swap (0 = auto).",
+                    },
+                ),
+                "prefetch_blocks": (
+                    "INT",
+                    {
+                        "default": 0,
+                        "min": 0,
+                        "max": 40,
+                        "step": 1,
+                        "tooltip": "Prefetch N blocks ahead for performance.",
+                    },
+                ),
+                "block_swap_debug": (
+                    "BOOLEAN",
+                    {
+                        "default": False,
+                        "tooltip": "Enable debug logging.",
+                    },
+                ),
+            },
+        }
+
+    RETURN_TYPES: tuple = ("ANY",)
+    RETURN_NAMES: tuple = ("model_clip_sequence",)
+    CATEGORY: str = "ComfyUI_Wan22Blockswap/looper"
+    FUNCTION: str = "apply_blockswap_to_sequence"
+    DESCRIPTION: str = (
+        "Apply BlockSwap to WanVideoLoraSequencer output. "
+        "Takes a list of (model_high, model_low, clip) tuples and applies "
+        "BlockSwap callbacks to each model. Output is compatible with "
+        "WanVideoLooper's model_clip_sequence input."
+    )
+
+    def apply_blockswap_to_sequence(
+        self,
+        model_clip_sequence: List[Tuple],
+        blocks_to_swap: int,
+        offload_txt_emb: bool,
+        offload_img_emb: bool,
+        use_non_blocking: bool = False,
+        vace_blocks_to_swap: int = 0,
+        prefetch_blocks: int = 0,
+        block_swap_debug: bool = False,
+    ) -> Tuple[List[Tuple]]:
+        """
+        Apply BlockSwap to a WanVideoLoraSequencer output.
+
+        Args:
+            model_clip_sequence: List of (model_high, model_low, clip) tuples
+            blocks_to_swap: Number of transformer blocks to swap to CPU
+            offload_txt_emb: Whether to offload text embeddings
+            offload_img_emb: Whether to offload image embeddings
+            use_non_blocking: Use non-blocking memory transfers
+            vace_blocks_to_swap: VACE blocks to swap (0=auto)
+            prefetch_blocks: Blocks to prefetch ahead
+            block_swap_debug: Enable debug logging
+
+        Returns:
+            Tuple containing the processed sequence (same format as input)
+        """
+        # Validate input
+        if not isinstance(model_clip_sequence, list):
+            raise ValueError("model_clip_sequence must be a list from WanVideoLoraSequencer")
+
+        if block_swap_debug:
+            print("[BlockSwap] ===== WAN22BlockSwapSequencer: Processing sequence =====")
+            print(f"[BlockSwap] Sequence length: {len(model_clip_sequence)}")
+            print(f"[BlockSwap] blocks_to_swap: {blocks_to_swap}")
+
+        # Count total models (2 per segment that has models)
+        total_models = 0
+        for segment_data in model_clip_sequence:
+            if segment_data and isinstance(segment_data, tuple) and len(segment_data) == 3:
+                model_high, model_low, _ = segment_data
+                if model_high is not None:
+                    total_models += 1
+                if model_low is not None:
+                    total_models += 1
+
+        if block_swap_debug:
+            print(f"[BlockSwap] Total models to process: {total_models}")
+
+        # Start a session for this sequence
+        session_id = start_blockswap_session(
+            loop_count=total_models,
+            block_swap_debug=block_swap_debug
+        )
+
+        if block_swap_debug:
+            print(f"[BlockSwap] Session started: {session_id}")
+
+        processed_sequence = []
+        model_counter = 0
+
+        try:
+            for i, segment_data in enumerate(model_clip_sequence):
+                if segment_data is None:
+                    processed_sequence.append(None)
+                    continue
+
+                if not isinstance(segment_data, tuple) or len(segment_data) != 3:
+                    # Pass through unchanged if not proper format
+                    processed_sequence.append(segment_data)
+                    continue
+
+                model_high, model_low, clip = segment_data
+
+                # Process high-noise model if present
+                if model_high is not None:
+                    prepared_high = prepare_model_for_loop(
+                        model=model_high,
+                        loop_index=model_counter,
+                        blocks_to_swap=blocks_to_swap,
+                        offload_txt_emb=offload_txt_emb,
+                        offload_img_emb=offload_img_emb,
+                        use_non_blocking=use_non_blocking,
+                        vace_blocks_to_swap=vace_blocks_to_swap,
+                        prefetch_blocks=prefetch_blocks,
+                        block_swap_debug=block_swap_debug,
+                        session_id=session_id,
+                    )
+                    model_counter += 1
+                else:
+                    prepared_high = None
+
+                # Process low-noise model if present
+                if model_low is not None:
+                    prepared_low = prepare_model_for_loop(
+                        model=model_low,
+                        loop_index=model_counter,
+                        blocks_to_swap=blocks_to_swap,
+                        offload_txt_emb=offload_txt_emb,
+                        offload_img_emb=offload_img_emb,
+                        use_non_blocking=use_non_blocking,
+                        vace_blocks_to_swap=vace_blocks_to_swap,
+                        prefetch_blocks=prefetch_blocks,
+                        block_swap_debug=block_swap_debug,
+                        session_id=session_id,
+                    )
+                    model_counter += 1
+                else:
+                    prepared_low = None
+
+                # CLIP is passed through unchanged (no BlockSwap needed)
+                processed_sequence.append((prepared_high, prepared_low, clip))
+
+                if block_swap_debug:
+                    print(f"[BlockSwap] Segment {i+1}: Processed")
+
+            if block_swap_debug:
+                print(f"[BlockSwap] ===== WAN22BlockSwapSequencer: Complete =====")
+                print(f"[BlockSwap] Processed {model_counter} models")
+
+        except Exception as e:
+            if block_swap_debug:
+                print(f"[BlockSwap] Error during sequence processing: {e}")
+            end_blockswap_session(session_id, block_swap_debug)
+            raise
+
+        return (processed_sequence,)
 
 
 # Node registration
 NODE_CLASS_MAPPINGS = {
-    "wan22BlockSwapLooper": WAN22BlockSwapLooper,
+    "wan22BlockSwapLooperModels": WAN22BlockSwapLooperModels,
+    "wan22BlockSwapSequencer": WAN22BlockSwapSequencer,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
-    "wan22BlockSwapLooper": "WAN 2.2 BlockSwap Looper (Loop-Aware)",
+    "wan22BlockSwapLooperModels": "WAN 2.2 BlockSwap Looper (High/Low Models)",
+    "wan22BlockSwapSequencer": "WAN 2.2 BlockSwap Sequencer (For LoRA Sequence)",
 }

@@ -213,6 +213,7 @@ def create_fresh_blockswap_tracker(
     tracker.cleanup_executed = False
     tracker.original_device = torch.device('cuda')
     tracker.is_gguf_model = False
+    tracker.blocks_restored = False  # For pre-unpatch restoration
 
     return tracker
 
