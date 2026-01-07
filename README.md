@@ -17,7 +17,8 @@
 >                    ***__!! THE "WAN BlockSwap Model Loader" MODEL LOADER NODE SHOULD NOT BE USED YET !!__***
 >                      
 >                                          ***IT IS STILL VERY EXPERIMENTAL AND WILL MOST LIKELY FLOOD YOUR VRAM***
->                      
+>
+>                                          ***THE WAN MODEL LOADER CURRENTLY ONLY WORKS WITH GGUF MODELS***
 
 
 
