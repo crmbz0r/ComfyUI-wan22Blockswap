@@ -110,11 +110,11 @@ class WANBlockSwapMetaLoader:
         # For low_noise models, wrap in lazy loader to defer loading
         if noise_level == "low_noise":
             if enable_debug:
-                logger.info("╔══════════════════════════════════════════════════════════════")
-                logger.info(f"║ WAN BlockSwap Meta Loader: LAZY LOAD (low_noise model)")
-                logger.info(f"║ Model: {model_path}")
-                logger.info(f"║ Model will load when sampler first needs it")
-                logger.info("╚══════════════════════════════════════════════════════════════")
+                logger.info("=" * 60)
+                logger.info("WAN BlockSwap Meta Loader: LAZY LOAD (low_noise model)")
+                logger.info(f"  Model: {model_path}")
+                logger.info("  Model will load when sampler first needs it")
+                logger.info("=" * 60)
             
             # Import LazyModelPatcher from blockswap_loader
             from .blockswap_loader import LazyModelPatcher

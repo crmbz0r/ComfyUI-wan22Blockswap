@@ -33,14 +33,16 @@ GGUF_TYPE_F16 = 1
 
 def load_gguf(file_path: str) -> Tuple[Dict[str, torch.Tensor], Any]:
     """
-    Load GGUF model file.
+    Load GGUF model file with eager data loading.
     
     This function loads a GGUF file and creates a state dict with
-    GGUFParameter tensors that store quantized data. The actual
-    dequantization happens on-demand during forward pass.
+    GGUFParameter tensors containing the actual quantized data.
+    Dequantization happens on-demand during forward pass via the
+    GGUFParameter's __torch_function__ hook.
     
-    The state dict contains meta tensors initially - the actual data
-    is loaded during weight assignment via the GGUF reader.
+    Unlike ComfyUI-GGUF's GGMLTensor, our GGUFParameter uses standard
+    torch.Tensor._make_subclass which works correctly with block swapping
+    operations (.to(), .clone(), .detach() all work as expected).
     
     Args:
         file_path: Path to GGUF model file
@@ -69,7 +71,7 @@ def load_gguf(file_path: str) -> Tuple[Dict[str, torch.Tensor], Any]:
     metadata = _parse_metadata(reader)
     logger.debug(f"GGUF metadata: {len(metadata)} fields")
     
-    # Create state dict with meta tensors
+    # Create state dict with actual tensor data (eager loading)
     state_dict: Dict[str, torch.Tensor] = {}
     quantized_count = 0
     float_count = 0
@@ -79,25 +81,33 @@ def load_gguf(file_path: str) -> Tuple[Dict[str, torch.Tensor], Any]:
         quant_type = tensor_info.tensor_type
         shape = tuple(tensor_info.shape)
         
+        # Load actual tensor data from GGUF file
+        # tensor_info.data is a numpy array with the raw data
+        try:
+            import numpy as np
+            raw_data = np.array(tensor_info.data)
+            tensor_data = torch.from_numpy(raw_data.copy())  # Copy to own the memory
+        except Exception as e:
+            logger.warning(f"Failed to load tensor {name}: {e}")
+            continue
+        
         # Check if tensor is quantized
         is_quantized = quant_type not in [GGUF_TYPE_F32, GGUF_TYPE_F16]
         
         if is_quantized:
-            # Create GGUFParameter with meta tensor
-            # The actual data will be loaded during weight assignment
-            meta_tensor = torch.empty(
-                _get_dequantized_shape(shape, quant_type),
-                device="meta",
-                dtype=torch.float16
-            )
-            param = GGUFParameter(meta_tensor, quant_type=quant_type)
-            param.gguf_shape = shape  # Store original quantized shape
+            # Create GGUFParameter with actual quantized data
+            # The data stays quantized until used in operations
+            param = GGUFParameter(tensor_data, quant_type=quant_type)
+            param.quant_shape = shape  # Store original shape
+            param.gguf_shape = shape   # Also store as gguf_shape for compatibility
             quantized_count += 1
         else:
-            # Non-quantized tensor
-            dtype = torch.float32 if quant_type == GGUF_TYPE_F32 else torch.float16
-            meta_tensor = torch.empty(shape, device="meta", dtype=dtype)
-            param = meta_tensor
+            # Non-quantized tensor - convert to proper dtype
+            if quant_type == GGUF_TYPE_F32:
+                tensor_data = tensor_data.to(dtype=torch.float32)
+            else:  # F16
+                tensor_data = tensor_data.to(dtype=torch.float16)
+            param = tensor_data
             float_count += 1
         
         # Convert GGUF key format to state dict format

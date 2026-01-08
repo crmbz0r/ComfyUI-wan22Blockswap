@@ -237,11 +237,11 @@ class WAN22BlockSwapLoader:
         """
         # For low_noise models, wrap in lazy loader to defer loading
         if noise_level == "low_noise":
-            logger.info("╔══════════════════════════════════════════════════════════════")
-            logger.info(f"║ WAN BlockSwap Loader: LAZY LOAD (low_noise model)")
-            logger.info(f"║ Model: {gguf_model if model_type == 'gguf' else safetensors_model}")
-            logger.info(f"║ Model will load when sampler first needs it")
-            logger.info("╚══════════════════════════════════════════════════════════════")
+            logger.info("=" * 60)
+            logger.info("WAN BlockSwap Loader: LAZY LOAD (low_noise model)")
+            logger.info(f"  Model: {gguf_model if model_type == 'gguf' else safetensors_model}")
+            logger.info("  Model will load when sampler first needs it")
+            logger.info("=" * 60)
             
             # Create lazy loader that defers actual loading
             lazy_patcher = LazyModelPatcher(
@@ -311,11 +311,11 @@ class WAN22BlockSwapLoader:
                 f"Model not found: {model_path}"
             )
         
-        logger.info(f"╔══════════════════════════════════════════════════════════════")
-        logger.info(f"║ WAN BlockSwap Loader: Loading {model_type} model")
-        logger.info(f"║ Model: {model_path}")
-        logger.info(f"║ Blocks to swap: {blocks_to_swap}")
-        logger.info(f"╚══════════════════════════════════════════════════════════════")
+        logger.info("=" * 60)
+        logger.info(f"WAN BlockSwap Loader: Loading {model_type} model")
+        logger.info(f"  Model: {model_path}")
+        logger.info(f"  Blocks to swap: {blocks_to_swap}")
+        logger.info("=" * 60)
         
         # Step 2: Memory cleanup before loading
         logger.info("Cleaning up memory before load...")
@@ -462,11 +462,11 @@ class WAN22BlockSwapLoader:
         mm.soft_empty_cache()
         
         # Log success
-        logger.info(f"╔══════════════════════════════════════════════════════════════")
-        logger.info(f"║ ✓ Model loaded successfully with pre-routed blocks!")
-        logger.info(f"║   GPU blocks: {gpu_blocks}, CPU blocks: {cpu_blocks}")
-        logger.info(f"║   Pre-routing info stored for downstream BlockSwap detection")
-        logger.info(f"╚══════════════════════════════════════════════════════════════")
+        logger.info("=" * 60)
+        logger.info("Model loaded successfully with pre-routed blocks!")
+        logger.info(f"  GPU blocks: {gpu_blocks}, CPU blocks: {cpu_blocks}")
+        logger.info("  Pre-routing info stored for downstream BlockSwap detection")
+        logger.info("=" * 60)
         
         return model_patcher
 
@@ -546,11 +546,11 @@ class LazyModelPatcher:
             object.__setattr__(self, '_load_triggered_by', trigger_name)
             
             model_name = self._loader_args.get('gguf_model') or self._loader_args.get('safetensors_model')
-            logger.info("╔══════════════════════════════════════════════════════════════")
-            logger.info(f"║ LazyModelPatcher: Loading low_noise model NOW")
-            logger.info(f"║ Model: {model_name}")
-            logger.info(f"║ Triggered by: {trigger_name}")
-            logger.info("╚══════════════════════════════════════════════════════════════")
+            logger.info("=" * 60)
+            logger.info("LazyModelPatcher: Loading low_noise model NOW")
+            logger.info(f"  Model: {model_name}")
+            logger.info(f"  Triggered by: {trigger_name}")
+            logger.info("=" * 60)
             
             try:
                 patcher = self._loader_func(**self._loader_args)

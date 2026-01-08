@@ -8,7 +8,8 @@ Provides core utilities for:
 - Per-block device routing during weight assignment
 - ModelPatcher creation
 """
-
+import os
+import sys
 import torch
 import torch.nn as nn
 import logging
@@ -81,42 +82,51 @@ def load_state_dict_to_cpu(
         return sd, None, None
     
     elif model_format == "gguf":
-        # Load GGUF using the proven implementation from the gguf custom node
-        # This returns GGMLTensor objects with proper tensor_shape attribute
+        # GGUF Loading Strategy:
+        # Currently we use ComfyUI-GGUF's loader as it properly integrates with
+        # ComfyUI's weight assignment system. Our native loader needs more work
+        # to properly handle deferred dequantization during weight assignment.
+        #
+        # Note: ComfyUI-GGUF's GGMLTensor may cause CUDA issues with block swap
+        # after 2-3 consecutive runs. For best GGUF + BlockSwap experience,
+        # consider using WanVideoWrapper's loader which has better GGUF handling.
+        
+        # Use ComfyUI-GGUF's loader
         try:
-            # Import from the existing gguf custom node (not our broken implementation)
+            # Import from ComfyUI-GGUF - the folder is ComfyUI-GGUF (with hyphen)
+            # and the function is gguf_sd_loader in loader.py
             import sys
             import os
             
-            # Add the gguf custom node to path if needed
-            gguf_node_path = os.path.join(
-                os.path.dirname(os.path.dirname(__file__)), "gguf"
-            )
-            if gguf_node_path not in sys.path:
-                sys.path.insert(0, gguf_node_path)
+            # Add custom_nodes to path if needed
+            custom_nodes_path = os.path.dirname(os.path.dirname(__file__))
+            if custom_nodes_path not in sys.path:
+                sys.path.insert(0, custom_nodes_path)
             
-            from pig import load_gguf_sd, GGMLTensor
+            # Try direct import first (works if ComfyUI-GGUF was loaded first)
+            try:
+                from importlib import import_module
+                gguf_loader = import_module("ComfyUI-GGUF.loader")
+                gguf_sd_loader = gguf_loader.gguf_sd_loader
+            except (ImportError, ModuleNotFoundError):
+                # Fallback: manually load the module
+                gguf_path = os.path.join(custom_nodes_path, "ComfyUI-GGUF")
+                if gguf_path not in sys.path:
+                    sys.path.insert(0, gguf_path)
+                from loader import gguf_sd_loader
             
-            # load_gguf_sd returns state dict with GGMLTensor objects
-            # All tensors are on CPU with proper tensor_shape for detection
-            sd = load_gguf_sd(file_path)
-            
-            logger.info(f"Loaded GGUF state dict with {len(sd)} tensors")
+            # Load with handle_prefix=None to get raw keys
+            sd = gguf_sd_loader(file_path, handle_prefix=None)
+            logger.info(f"Loaded GGUF using ComfyUI-GGUF ({len(sd)} tensors)")
             return sd, None, None
             
-        except ImportError as e:
-            # Fallback: try direct import if gguf node is installed as package
-            try:
-                from custom_nodes.gguf.pig import load_gguf_sd
-                sd = load_gguf_sd(file_path)
-                logger.info(f"Loaded GGUF state dict with {len(sd)} tensors (fallback)")
-                return sd, None, None
-            except ImportError:
-                raise ImportError(
-                    f"GGUF support requires the 'gguf' custom node to be installed. "
-                    f"Please install: https://github.com/city96/ComfyUI-GGUF. "
-                    f"Error: {e}"
-                )
+        except Exception as e:
+            raise ImportError(
+                f"GGUF loading failed: {e}\n"
+                "GGUF support requires ComfyUI-GGUF custom node:\n"
+                "  https://github.com/city96/ComfyUI-GGUF\n"
+                "Install via ComfyUI Manager or git clone into custom_nodes/"
+            )
     
     else:
         raise ValueError(f"Unsupported format: {model_format}")
@@ -554,11 +564,15 @@ def create_model_skeleton(
     # For GGUF models, use GGMLOps which properly dequantizes weights during forward
     if is_gguf:
         try:
-            from custom_nodes.gguf.pig import GGMLOps
+            # Add ComfyUI-GGUF folder to path if needed
+            gguf_folder = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "ComfyUI-GGUF")
+            if gguf_folder not in sys.path:
+                sys.path.insert(0, gguf_folder)
+            from ops import GGMLOps
             operations = GGMLOps
             logger.info("Using GGMLOps for GGUF model (proper dequantization)")
-        except ImportError:
-            logger.warning("Could not import GGMLOps, falling back to manual_cast")
+        except ImportError as e:
+            logger.warning(f"Could not import GGMLOps ({e}), falling back to manual_cast")
             operations = comfy.ops.manual_cast
     else:
         operations = comfy.ops.manual_cast
@@ -639,8 +653,21 @@ def create_model_patcher(
     # Create the patcher (use GGUFModelPatcher for GGUF models)
     if is_gguf:
         try:
-            # Import GGUFModelPatcher from the gguf custom node
-            from custom_nodes.gguf.pig import GGUFModelPatcher
+            # Import GGUFModelPatcher from ComfyUI-GGUF
+            # The module is loaded by ComfyUI, so we need to access it properly
+            import sys
+            import os
+            
+            # Try direct import from the loaded module
+            try:
+                # If ComfyUI-GGUF was already loaded, its nodes module is available
+                gguf_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), "ComfyUI-GGUF")
+                if gguf_path not in sys.path:
+                    sys.path.insert(0, gguf_path)
+                from nodes import GGUFModelPatcher
+            except ImportError:
+                # Fallback - shouldn't happen if ComfyUI-GGUF is installed
+                raise ImportError("ComfyUI-GGUF not found")
             
             # Create a GGUFModelPatcher directly (same interface as ModelPatcher)
             patcher = GGUFModelPatcher(
@@ -649,8 +676,8 @@ def create_model_patcher(
                 offload_device=offload_device,
             )
             logger.info("Created GGUFModelPatcher for GGUF model")
-        except ImportError:
-            logger.warning("Could not import GGUFModelPatcher, falling back to regular ModelPatcher")
+        except ImportError as e:
+            logger.warning(f"Could not import GGUFModelPatcher ({e}), falling back to regular ModelPatcher")
             patcher = ModelPatcher(
                 model=base_model,
                 load_device=load_device,

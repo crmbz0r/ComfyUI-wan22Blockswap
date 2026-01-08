@@ -11,6 +11,7 @@ ACTIVE NODES (working and tested):
 - WAN22BlockSwapCleanup: Clean up BlockSwap state after sampling
 - WAN22BlockSwapReposition: Re-position blocks for next sampling run
 - WAN22FullCleanup: Aggressive cleanup at end of workflow
+- WAN22TiledVAEDecode: High-quality tiled VAE decode for WAN video models
 
 DEPRECATED NODES (commented out, kept for reference):
 - wan22BlockSwap: Old callback-based approach
@@ -61,11 +62,16 @@ from .blockswap_forward import (
     WAN22FullCleanup,
     BlockSwapForwardPatcher,
 )
+from .vae_decode import (
+    NODE_CLASS_MAPPINGS as _VAE_DECODE_MAPPINGS,
+    NODE_DISPLAY_NAME_MAPPINGS as _VAE_DECODE_DISPLAY_MAPPINGS,
+    WAN22TiledVAEDecode,
+)
 from .config import BlockSwapConfig
 
 # Merge node mappings from active modules only
-NODE_CLASS_MAPPINGS = {**_WAN_LOADER_MAPPINGS, **_FORWARD_PATCHER_MAPPINGS}
-NODE_DISPLAY_NAME_MAPPINGS = {**_WAN_LOADER_DISPLAY_MAPPINGS, **_FORWARD_PATCHER_DISPLAY_MAPPINGS}
+NODE_CLASS_MAPPINGS = {**_WAN_LOADER_MAPPINGS, **_FORWARD_PATCHER_MAPPINGS, **_VAE_DECODE_MAPPINGS}
+NODE_DISPLAY_NAME_MAPPINGS = {**_WAN_LOADER_DISPLAY_MAPPINGS, **_FORWARD_PATCHER_DISPLAY_MAPPINGS, **_VAE_DECODE_DISPLAY_MAPPINGS}
 
 # Register JavaScript directory for frontend UI extensions
 WEB_DIRECTORY = "./js"
@@ -109,6 +115,7 @@ __all__ = [
     "WAN22BlockSwapCleanup",         # Cleanup node to free memory
     "WAN22BlockSwapReposition",      # Reposition blocks after cleanup
     "WAN22FullCleanup",              # Aggressive cleanup at end of workflow
+    "WAN22TiledVAEDecode",           # High-quality tiled VAE decode for WAN video
     
     # Core components
     "BlockSwapForwardPatcher",       # Core forward patching logic

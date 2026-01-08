@@ -36,6 +36,68 @@ except (ImportError, AttributeError):
 logger = logging.getLogger("ComfyUI_Wan22Blockswap")
 
 
+# ============================================================================
+# CUDA Health Check Functions
+# ============================================================================
+
+_cuda_corruption_detected = False
+
+
+def reset_cuda_corruption_flag():
+    """Reset the CUDA corruption flag (call at start of new generation)."""
+    global _cuda_corruption_detected
+    _cuda_corruption_detected = False
+
+
+def is_cuda_healthy() -> bool:
+    """
+    Check if CUDA is in a healthy state by attempting basic operations.
+    
+    Returns True if CUDA operations work, False if corrupted.
+    """
+    global _cuda_corruption_detected
+    
+    if _cuda_corruption_detected:
+        return False
+    
+    if not torch.cuda.is_available():
+        return True  # No CUDA, so technically "healthy"
+    
+    try:
+        # Try a simple CUDA operation
+        device = torch.device("cuda", 0)
+        
+        # Small test tensor allocation
+        test = torch.zeros(16, device=device)
+        test = test + 1
+        del test
+        
+        # Sync to catch any delayed errors
+        torch.cuda.synchronize()
+        
+        return True
+    except RuntimeError as e:
+        if "CUDA" in str(e) or "cuda" in str(e):
+            _cuda_corruption_detected = True
+            logger.error(f"CUDA corruption detected: {e}")
+            return False
+        raise
+
+
+def check_cuda_or_raise(context: str = ""):
+    """
+    Check CUDA health and raise with helpful message if corrupted.
+    
+    Args:
+        context: Description of what operation was attempted
+    """
+    if not is_cuda_healthy():
+        msg = "CUDA state is corrupted. Please restart ComfyUI to continue."
+        if context:
+            msg = f"CUDA corruption detected during {context}. {msg}"
+        raise RuntimeError(msg)
+
+
 class FilteredWriter:
     """Wrapper for stdout/stderr that filters out specific messages."""
     def __init__(self, original, filter_patterns):
@@ -212,6 +274,119 @@ class BlockSwapForwardPatcher:
         
         # Track loaded size for ComfyUI compatibility
         self._reported_loaded_size = 0
+        
+        # Detect if this is a GGUF model and what type
+        self._gguf_type = self._detect_gguf_type()
+        self._is_gguf_model = self._gguf_type is not None
+        
+        if self._gguf_type == "comfyui-gguf":
+            # ComfyUI-GGUF uses GGMLTensor with problematic custom .to()/.clone()/.detach()
+            logger.warning("=" * 70)
+            logger.warning("WARNING: ComfyUI-GGUF model detected!")
+            logger.warning("ComfyUI-GGUF's GGMLTensor has custom methods that may cause")
+            logger.warning("CUDA corruption after multiple generations with block swap.")
+            logger.warning("")
+            logger.warning("If you experience 'CUDA error: invalid argument' after 2-3 runs:")
+            logger.warning("  1. Restart ComfyUI to reset CUDA state")
+            logger.warning("  2. Consider using WanVideoWrapper's GGUF loader instead,")
+            logger.warning("     which has a more stable GGUF implementation")
+            logger.warning("=" * 70)
+        elif self._gguf_type == "wanvideowrapper":
+            logger.info("  Model type: WanVideoWrapper GGUF (safe GGUFParameter)")
+        elif self._is_gguf_model:
+            logger.info("  Model type: Unknown GGUF (using cautious handling)")
+    
+    def _detect_gguf_type(self) -> Optional[str]:
+        """
+        Detect if the model contains GGUF tensors and identify the source.
+        
+        Returns:
+            - "comfyui-gguf": ComfyUI-GGUF package (problematic GGMLTensor)
+            - "wanvideowrapper": WanVideoWrapper's GGUF or this package's GGUF (safer GGUFParameter)
+            - "unknown": Some other GGUF implementation
+            - None: Not a GGUF model
+        """
+        try:
+            for param in self.diffusion_model.parameters():
+                param_type = type(param).__name__
+                param_module = type(param).__module__ or ""
+                
+                # Check for ComfyUI-GGUF's GGMLTensor
+                # Key identifiers: tensor_type, tensor_shape, ggml_* methods, patches_uuid
+                if param_type == 'GGMLTensor' or 'GGMLTensor' in param_type:
+                    # Check for the problematic custom methods
+                    has_custom_clone = hasattr(param, 'clone') and getattr(type(param).clone, '__func__', None) is not getattr(torch.Tensor.clone, '__func__', object())
+                    if hasattr(param, 'tensor_type') or hasattr(param, 'patches_uuid'):
+                        logger.debug(f"Detected ComfyUI-GGUF GGMLTensor in param")
+                        return "comfyui-gguf"
+                
+                # Check for WanVideoWrapper's GGUFParameter or this package's GGUFParameter
+                # Key identifiers: quant_type, quant_shape (ours uses quant_shape not as_tensor)
+                if param_type == 'GGUFParameter' or 'GGUFParameter' in param_type:
+                    if hasattr(param, 'quant_type'):
+                        # Either WanVideoWrapper or our own - both are safe
+                        logger.debug(f"Detected safe GGUFParameter in param (module: {param_module})")
+                        return "wanvideowrapper"
+                
+                # Generic GGUF detection
+                if 'GGML' in param_type or 'GGUF' in param_type:
+                    return "unknown"
+                if hasattr(param, 'tensor_type') or hasattr(param, 'quant_type'):
+                    return "unknown"
+                    
+        except Exception as e:
+            logger.debug(f"Exception during GGUF detection: {e}")
+        
+        return None
+    
+    def _safe_block_to_device(self, block: nn.Module, device: torch.device, sync: bool = True):
+        """
+        Move a block to a device safely, handling GGUF tensors carefully.
+        
+        For ComfyUI-GGUF models (GGMLTensor), we add extra precautions:
+        - Full synchronization before and after
+        - Always blocking transfers
+        - Extra error handling
+        
+        For WanVideoWrapper GGUF (GGUFParameter), standard handling is fine.
+        """
+        try:
+            # For ComfyUI-GGUF, be extra careful
+            if self._gguf_type == "comfyui-gguf":
+                # Full sync before any movement
+                if torch.cuda.is_available():
+                    torch.cuda.synchronize()
+                
+                # Move the block with blocking transfer
+                block.to(device, non_blocking=False)
+                
+                # Full sync after to ensure completion
+                if torch.cuda.is_available():
+                    torch.cuda.synchronize()
+                    
+            else:
+                # Standard path for non-GGUF or WanVideoWrapper GGUF
+                if sync and torch.cuda.is_available():
+                    torch.cuda.synchronize()
+                
+                # Move the block
+                use_non_blocking = self.use_non_blocking and not self._is_gguf_model
+                block.to(device, non_blocking=use_non_blocking)
+                
+                if sync and torch.cuda.is_available():
+                    torch.cuda.synchronize()
+                
+        except RuntimeError as e:
+            error_msg = str(e).lower()
+            if "cuda" in error_msg or "invalid argument" in error_msg:
+                logger.error(f"CUDA error during block movement: {e}")
+                if self._gguf_type == "comfyui-gguf":
+                    logger.error("This is likely due to ComfyUI-GGUF's GGMLTensor behavior.")
+                    logger.error("Please restart ComfyUI to reset CUDA state.")
+                else:
+                    logger.error("CUDA state may be corrupted - restart ComfyUI recommended")
+                raise
+            raise
     
     def calculate_model_size(self) -> int:
         """Calculate total model size in bytes for ComfyUI compatibility."""
@@ -262,6 +437,10 @@ class BlockSwapForwardPatcher:
         """
         logger.info("Pre-positioning blocks for block swap...")
         
+        # For ComfyUI-GGUF models, check CUDA health first
+        if self._gguf_type == "comfyui-gguf":
+            check_cuda_or_raise("pre_position_blocks start (ComfyUI-GGUF model)")
+        
         # CRITICAL: Reset CUDA first to catch any lingering errors
         self._reset_cuda_if_needed()
         
@@ -273,6 +452,12 @@ class BlockSwapForwardPatcher:
                 torch.cuda.synchronize()
             except RuntimeError as e:
                 logger.warning(f"CUDA sync warning (attempting reset): {e}")
+                if self._gguf_type == "comfyui-gguf":
+                    raise RuntimeError(
+                        "CUDA sync failed with ComfyUI-GGUF model. "
+                        "This is a known issue with GGMLTensor block swapping. "
+                        "Please restart ComfyUI to reset the CUDA state."
+                    ) from e
                 try:
                     # Try to reset CUDA context
                     torch.cuda.reset_peak_memory_stats()
@@ -293,25 +478,26 @@ class BlockSwapForwardPatcher:
         
         # Move non-block parameters to GPU (patch_embedding, head, etc.)
         # Suppress "unpin tensor" warnings during transfers
+        # Always use blocking transfers for GGUF safety
         with suppress_unpin_warnings():
             for name, param in self.diffusion_model.named_parameters():
                 if "blocks." not in name:
                     # Keep non-block params on GPU
                     if param.device != self.main_device:
-                        param.data = param.data.to(self.main_device, non_blocking=self.use_non_blocking)
+                        param.data = param.data.to(self.main_device, non_blocking=False)
                 elif self.offload_txt_emb and "txt_emb" in name:
-                    param.data = param.data.to(self.offload_device, non_blocking=self.use_non_blocking)
+                    param.data = param.data.to(self.offload_device, non_blocking=False)
                 elif self.offload_img_emb and "img_emb" in name:
-                    param.data = param.data.to(self.offload_device, non_blocking=self.use_non_blocking)
+                    param.data = param.data.to(self.offload_device, non_blocking=False)
             
-            # Position blocks
+            # Position blocks - use _safe_block_to_device for proper GGUF handling
             for b, block in enumerate(self.blocks):
                 if b < self.swap_start_idx:
                     # Keep on GPU
-                    block.to(self.main_device, non_blocking=self.use_non_blocking)
+                    self._safe_block_to_device(block, self.main_device, sync=False)
                 else:
                     # Move to CPU
-                    block.to(self.offload_device, non_blocking=self.use_non_blocking)
+                    self._safe_block_to_device(block, self.offload_device, sync=False)
         
         # Sync to ensure all transfers complete
         if torch.cuda.is_available():
@@ -343,7 +529,7 @@ class BlockSwapForwardPatcher:
             # Suppress "unpin tensor" warnings during transfers
             with suppress_unpin_warnings():
                 for b, block in enumerate(self.blocks):
-                    block.to(self.offload_device, non_blocking=False)
+                    self._safe_block_to_device(block, self.offload_device, sync=False)
                 
                 # Move non-block params to CPU too
                 for name, param in self.diffusion_model.named_parameters():
@@ -363,6 +549,11 @@ class BlockSwapForwardPatcher:
         
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
+        
+        # For ComfyUI-GGUF models, verify CUDA health after cleanup
+        if self._gguf_type == "comfyui-gguf":
+            if not is_cuda_healthy():
+                logger.warning("CUDA health check failed after cleanup - state may be corrupted")
         
         logger.info("BlockSwap cleanup complete")
     
@@ -440,40 +631,63 @@ class BlockSwapForwardPatcher:
         """
         patcher = self
         
+        wrapped_count = 0
+        skipped_count = 0
+        
         for b, block in enumerate(self.blocks):
             if b >= self.swap_start_idx:
-                # Check if this block is ALREADY wrapped - if so, use the ORIGINAL forward
+                # Check if this block is ALREADY wrapped - if so, SKIP re-wrapping
                 if hasattr(block, '_blockswap_wrapped') and block._blockswap_wrapped:
-                    # Already wrapped from a previous run - restore original first
                     if hasattr(block, '_original_forward'):
-                        original_block_forward = block._original_forward
-                        logger.debug(f"Block {b} was already wrapped, using stored original forward")
+                        # Already properly wrapped - don't double-wrap!
+                        logger.debug(f"Block {b} already wrapped, skipping")
+                        skipped_count += 1
+                        continue
                     else:
-                        original_block_forward = block.forward
-                        logger.warning(f"Block {b} marked as wrapped but no original found!")
-                else:
-                    # Not wrapped yet
-                    original_block_forward = block.forward
+                        # Marked as wrapped but no original - this is a bug state
+                        # Try to unwrap by assuming current forward is usable
+                        logger.warning(f"Block {b} marked wrapped but no _original_forward - resetting")
+                        block._blockswap_wrapped = False
                 
+                # Not wrapped yet - wrap it
+                original_block_forward = block.forward
                 block_idx = b
                 
                 def make_wrapped_forward(orig_forward, idx):
                     def wrapped_forward(*args, **kwargs):
-                        # === MOVE TO GPU ===
+                        block = patcher.blocks[idx]
+                        
+                        # Check CUDA health before doing anything
+                        check_cuda_or_raise(f"block {idx} forward")
+                        
+                        # Check if block is already on GPU - skip transfer if so
+                        first_param = next(block.parameters(), None)
+                        already_on_gpu = first_param is not None and first_param.device.type == 'cuda'
+                        
+                        # === MOVE TO GPU (only if needed) ===
                         if patcher.debug:
                             transfer_start = time.perf_counter()
                         
-                        # Sync before moving to ensure clean state
-                        if torch.cuda.is_available():
-                            torch.cuda.synchronize()
-                        
-                        # Move this block to GPU (suppress "unpin tensor" warnings)
-                        with suppress_unpin_warnings():
-                            patcher.blocks[idx].to(patcher.main_device, non_blocking=patcher.use_non_blocking)
-                        
-                        # Sync after moving to GPU
-                        if torch.cuda.is_available():
-                            torch.cuda.synchronize()
+                        if not already_on_gpu:
+                            try:
+                                # Sync before moving to ensure clean state
+                                if torch.cuda.is_available():
+                                    torch.cuda.synchronize()
+                                
+                                # Move this block to GPU (suppress "unpin tensor" warnings)
+                                # Use blocking transfer for GGUF safety
+                                with suppress_unpin_warnings():
+                                    block.to(patcher.main_device, non_blocking=False)
+                                
+                                # Sync after moving to GPU
+                                if torch.cuda.is_available():
+                                    torch.cuda.synchronize()
+                            except RuntimeError as e:
+                                if "CUDA" in str(e) or "cuda" in str(e):
+                                    global _cuda_corruption_detected
+                                    _cuda_corruption_detected = True
+                                    logger.error(f"CUDA error moving block {idx} to GPU: {e}")
+                                raise
                         
                         if patcher.debug:
                             transfer_end = time.perf_counter()
@@ -492,18 +706,28 @@ class BlockSwapForwardPatcher:
                             compute_time = compute_end - compute_start
                             to_cpu_start = time.perf_counter()
                         
-                        # === MOVE BACK TO CPU ===
-                        with suppress_unpin_warnings():
-                            patcher.blocks[idx].to(patcher.offload_device, non_blocking=patcher.use_non_blocking)
-                        
-                        # Sync after moving to CPU
-                        if torch.cuda.is_available():
-                            torch.cuda.synchronize()
+                        # === MOVE BACK TO CPU (only if we moved it, to maintain consistent state) ===
+                        if not already_on_gpu:
+                            try:
+                                with suppress_unpin_warnings():
+                                    block.to(patcher.offload_device, non_blocking=False)
+                                
+                                # Sync after moving to CPU
+                                if torch.cuda.is_available():
+                                    torch.cuda.synchronize()
+                            except RuntimeError as e:
+                                if "CUDA" in str(e) or "cuda" in str(e):
+                                    _cuda_corruption_detected = True
+                                    logger.error(f"CUDA error moving block {idx} to CPU: {e}")
+                                raise
                         
                         if patcher.debug:
                             to_cpu_end = time.perf_counter()
                             to_cpu_time = to_cpu_end - to_cpu_start
-                            logger.info(f"Block {idx}: transfer_time={transfer_time:.4f}s, compute_time={compute_time:.4f}s, to_cpu_transfer_time={to_cpu_time:.4f}s")
+                            if already_on_gpu:
+                                logger.info(f"Block {idx}: [GPU-RESIDENT] compute_time={compute_time:.4f}s")
+                            else:
+                                logger.info(f"Block {idx}: transfer_time={transfer_time:.4f}s, compute_time={compute_time:.4f}s, to_cpu_transfer_time={to_cpu_time:.4f}s")
                         
                         return result
                     
@@ -513,6 +737,12 @@ class BlockSwapForwardPatcher:
                 block.forward = make_wrapped_forward(original_block_forward, block_idx)
                 block._original_forward = original_block_forward
                 block._blockswap_wrapped = True
+                wrapped_count += 1
+        
+        if wrapped_count > 0:
+            logger.info(f"Wrapped {wrapped_count} blocks for swapping (skipped {skipped_count} already wrapped)")
+        else:
+            logger.info(f"All {skipped_count} blocks already wrapped, no new wrapping needed")
     
     def unpatch(self):
         """
@@ -914,16 +1144,22 @@ class WAN22BlockSwapComboPatcher:
             old_patcher = model._blockswap_patcher
             
             # CRITICAL: Move ALL blocks to CPU first to reset state
+            # Use the patcher's safe method if available for GGUF compatibility
             try:
                 with suppress_unpin_warnings():
                     if hasattr(old_patcher, 'blocks') and old_patcher.blocks is not None:
                         logger.info(f"  Moving all blocks to CPU for {model_name}...")
+                        has_safe_method = hasattr(old_patcher, '_safe_block_to_device')
                         for idx, block in enumerate(old_patcher.blocks):
                             try:
                                 # Reset CUDA before each block move to handle async errors
                                 if idx % 5 == 0:  # Every 5 blocks
                                     self._reset_cuda_error_state()
-                                block.to(torch.device("cpu"), non_blocking=False)
+                                # Use safe block movement if available
+                                if has_safe_method:
+                                    old_patcher._safe_block_to_device(block, torch.device("cpu"), idx)
+                                else:
+                                    block.to(torch.device("cpu"), non_blocking=False)
                             except Exception as e:
                                 logger.warning(f"  Block {idx} move failed: {e}")
                                 # Try to recover and continue
@@ -1008,11 +1244,11 @@ class WAN22BlockSwapComboPatcher:
         return patcher
     
     def _move_all_blocks_to_cpu(self, patcher, model_name):
-        """Move ALL blocks of a model to CPU."""
+        """Move ALL blocks of a model to CPU using safe block movement."""
         logger.info(f"Moving ALL blocks to CPU for {model_name}...")
         with suppress_unpin_warnings():
             for idx, block in enumerate(patcher.blocks):
-                block.to(patcher.offload_device, non_blocking=False)
+                patcher._safe_block_to_device(block, patcher.offload_device, idx)
         if torch.cuda.is_available():
             torch.cuda.synchronize()
         logger.info(f"  {model_name}: All {len(patcher.blocks)} blocks now on CPU")
@@ -1055,6 +1291,16 @@ class WAN22BlockSwapComboPatcher:
         HIGH noise model: blocks positioned on GPU, ready to sample
         LOW noise model: ALL blocks on CPU, will be positioned when high finishes
         """
+        # Reset the CUDA corruption flag at the start of each new generation
+        reset_cuda_corruption_flag()
+        
+        # Check CUDA health before we start
+        try:
+            check_cuda_or_raise("patch_models start")
+        except RuntimeError as e:
+            logger.error(str(e))
+            raise
+        
         # Install persistent warning filter for the entire sampling process
         # This suppresses "Tried to unpin tensor not pinned by ComfyUI" spam
         install_unpin_warning_filter()
@@ -1064,13 +1310,40 @@ class WAN22BlockSwapComboPatcher:
         logger.info("  For use with Integrated KSampler / WanVideoLooper")
         logger.info("=" * 60)
         
-        # Reset CUDA state
+        # ========================================
+        # Pre-cleanup: Ensure CUDA is in a good state
+        # ========================================
+        # This is critical when queueing multiple runs - the previous run
+        # may have left CUDA in a bad state
         if torch.cuda.is_available():
             try:
+                # Synchronize any pending operations
                 torch.cuda.synchronize()
+                
+                # Clear any cached memory
                 torch.cuda.empty_cache()
-            except Exception as e:
-                logger.warning(f"Pre-patch CUDA reset warning: {e}")
+                
+                # Reset peak memory stats
+                torch.cuda.reset_peak_memory_stats()
+                
+                # Verify CUDA is responsive with a small test allocation
+                test_tensor = torch.zeros(1, device='cuda')
+                del test_tensor
+                torch.cuda.synchronize()
+                
+            except RuntimeError as e:
+                # CUDA is in a bad state - try to recover
+                logger.warning(f"CUDA state issue detected: {e}")
+                logger.warning("Attempting CUDA recovery...")
+                try:
+                    # Force empty cache
+                    torch.cuda.empty_cache()
+                    # Try synchronization again
+                    torch.cuda.synchronize()
+                except Exception as e2:
+                    logger.error(f"CUDA recovery failed: {e2}")
+                    logger.error("You may need to restart ComfyUI to clear CUDA errors")
+        
         gc.collect()
         
         # Clean up any existing patchers from previous runs
@@ -1089,6 +1362,26 @@ class WAN22BlockSwapComboPatcher:
         # Get block counts for logging
         num_blocks_high = len(model_high.model.diffusion_model.blocks)
         num_blocks_low = len(model_low.model.diffusion_model.blocks)
+        
+        # CRITICAL CHECK: Ensure HIGH and LOW don't share the same diffusion_model
+        # If they do, wrapping one will affect the other, causing double-wrapping
+        if model_high.model.diffusion_model is model_low.model.diffusion_model:
+            logger.error("=" * 60)
+            logger.error("ERROR: HIGH and LOW models share the same diffusion_model!")
+            logger.error("This will cause double-wrapping and duplicate block swaps.")
+            logger.error("Each model must have its own diffusion_model instance.")
+            logger.error("=" * 60)
+            raise ValueError("HIGH and LOW models must have separate diffusion_model instances")
+        
+        # Also check if blocks are the same objects
+        blocks_high = model_high.model.diffusion_model.blocks
+        blocks_low = model_low.model.diffusion_model.blocks
+        if blocks_high is blocks_low:
+            logger.error("=" * 60)
+            logger.error("ERROR: HIGH and LOW models share the same blocks list!")
+            logger.error("This will cause double-wrapping and duplicate block swaps.")
+            logger.error("=" * 60)
+            raise ValueError("HIGH and LOW models must have separate block instances")
         
         logger.info(f"High noise model: {num_blocks_high} blocks")
         logger.info(f"Low noise model: {num_blocks_low} blocks")
@@ -1216,17 +1509,92 @@ class WAN22BlockSwapComboPatcher:
             from comfy.patcher_extension import CallbacksMP
             model_high.add_callback(CallbacksMP.ON_CLEANUP, on_high_noise_cleanup)
             logger.info("Added ON_CLEANUP callback to HIGH noise model")
-            logger.info("  → When high noise sampling finishes, low noise will be positioned")
+            logger.info("  -> When high noise sampling finishes, low noise will be positioned")
             
-            # Add cleanup callback to low noise model to uninstall warning filter
+            # Add cleanup callback to low noise model for proper cleanup
             def on_low_noise_cleanup(model_instance):
-                """Called when low noise model finishes - uninstall warning filter."""
-                logger.debug("Low noise cleanup - uninstalling warning filter")
+                """
+                Called when low noise model finishes sampling (ON_CLEANUP).
+                This cleans up BOTH models to prevent CUDA errors when ComfyUI
+                tries to unload models (e.g., for VAE decode or next iteration).
+                """
+                logger.info("")
+                logger.info("=" * 60)
+                logger.info("LOW NOISE COMPLETE - Cleaning up BOTH models")
+                logger.info("=" * 60)
+                
+                # Get both patchers
+                high_patcher = getattr(model_high, '_blockswap_patcher', None)
+                low_patcher = getattr(model_low, '_blockswap_patcher', None)
+                
+                # CRITICAL: Move ALL blocks of BOTH models to CPU
+                # This ensures models are in a consistent state before ComfyUI
+                # tries to unload them (e.g., for VAE decode)
+                
+                # Sync CUDA first
+                if torch.cuda.is_available():
+                    try:
+                        torch.cuda.synchronize()
+                    except Exception as e:
+                        logger.warning(f"CUDA sync warning: {e}")
+                
+                # Clean up LOW noise model (was just active) - use safe method if available
+                if low_patcher is not None:
+                    logger.info("Moving LOW noise blocks to CPU...")
+                    try:
+                        with suppress_unpin_warnings():
+                            for idx, block in enumerate(low_patcher.blocks):
+                                low_patcher._safe_block_to_device(block, low_patcher.offload_device, idx)
+                            # Move non-block params too
+                            for name, param in low_patcher.diffusion_model.named_parameters():
+                                if "blocks." not in name:
+                                    param.data = param.data.to(low_patcher.offload_device, non_blocking=False)
+                        if torch.cuda.is_available():
+                            torch.cuda.synchronize()
+                    except Exception as e:
+                        logger.warning(f"Error cleaning up low noise: {e}")
+                
+                # Clean up HIGH noise model (was moved to CPU earlier, but ensure it's fully there)
+                if high_patcher is not None:
+                    logger.info("Ensuring HIGH noise blocks are on CPU...")
+                    try:
+                        with suppress_unpin_warnings():
+                            for idx, block in enumerate(high_patcher.blocks):
+                                high_patcher._safe_block_to_device(block, high_patcher.offload_device, idx)
+                            for name, param in high_patcher.diffusion_model.named_parameters():
+                                if "blocks." not in name:
+                                    param.data = param.data.to(high_patcher.offload_device, non_blocking=False)
+                        if torch.cuda.is_available():
+                            torch.cuda.synchronize()
+                    except Exception as e:
+                        logger.warning(f"Error cleaning up high noise: {e}")
+                
+                # Clear CUDA cache
+                if torch.cuda.is_available():
+                    try:
+                        torch.cuda.empty_cache()
+                    except Exception as e:
+                        logger.warning(f"CUDA cache clear warning: {e}")
+                gc.collect()
+                
+                # Uninstall warning filter
                 uninstall_unpin_warning_filter()
+                
+                # Report VRAM status
+                if torch.cuda.is_available():
+                    allocated = torch.cuda.memory_allocated() / (1024**3)
+                    reserved = torch.cuda.memory_reserved() / (1024**3)
+                    logger.info(f"VRAM after cleanup - Allocated: {allocated:.2f} GB, Reserved: {reserved:.2f} GB")
+                
+                # Reset CUDA corruption flag for next iteration
+                reset_cuda_corruption_flag()
+                
+                logger.info("Both models cleaned up - ready for next iteration or VAE decode")
+                logger.info("=" * 60)
             
             model_low.add_callback(CallbacksMP.ON_CLEANUP, on_low_noise_cleanup)
             logger.info("Added ON_CLEANUP callback to LOW noise model")
-            logger.info("  → Will clean up warning filter after sampling completes")
+            logger.info("  -> Will clean up BOTH models after sampling completes")
             
         except Exception as e:
             logger.error(f"CRITICAL: Could not add cleanup callback: {e}")
@@ -1234,7 +1602,53 @@ class WAN22BlockSwapComboPatcher:
             logger.error("Consider using separate KSamplers instead of combo KSampler.")
         
         # ========================================
-        # Final: Report status
+        # Final: Ensure CUDA is in clean state for subsequent operations
+        # ========================================
+        # This is CRITICAL - without this, the CLIP model loading may fail
+        # with "CUDA error: invalid argument" because the GPU state is corrupted
+        # from all our block movements
+        if torch.cuda.is_available():
+            try:
+                # Full synchronization to flush all pending operations
+                torch.cuda.synchronize()
+                
+                # Empty cache to defragment memory
+                torch.cuda.empty_cache()
+                
+                # Reset memory stats (helps with some edge cases)
+                torch.cuda.reset_peak_memory_stats()
+                
+                # One more sync to be safe
+                torch.cuda.synchronize()
+                
+                # Test allocation to verify GPU is responsive
+                # Use a reasonable size (1MB) to catch fragmentation issues
+                test_tensor = torch.zeros(256, 1024, device='cuda', dtype=torch.float32)  # 1MB
+                del test_tensor
+                torch.cuda.synchronize()
+                
+                # Small delay to let CUDA driver fully stabilize
+                # This helps when many tensor movements have occurred
+                time.sleep(0.1)
+                
+                # Final sync and cache clear
+                torch.cuda.synchronize()
+                torch.cuda.empty_cache()
+                
+            except Exception as e:
+                logger.warning(f"Post-setup CUDA cleanup warning: {e}")
+                # Try to recover
+                try:
+                    torch.cuda.empty_cache()
+                    torch.cuda.synchronize()
+                except:
+                    pass
+        
+        # Force garbage collection
+        gc.collect()
+        
+        # ========================================
+        # Report status
         # ========================================
         logger.info("")
         if torch.cuda.is_available():
@@ -1245,11 +1659,29 @@ class WAN22BlockSwapComboPatcher:
         logger.info("")
         logger.info("=" * 60)
         logger.info("Combo Patcher Setup Complete!")
-        logger.info("  ✓ HIGH noise: Blocks positioned, ready to sample")
-        logger.info("  ✓ LOW noise: All blocks on CPU, waiting")
-        logger.info("  ✓ Callbacks: Model switch + filter cleanup registered")
-        logger.info("  ✓ Unpin warnings: Suppressed for clean output")
+        logger.info("  [OK] HIGH noise: Blocks positioned, ready to sample")
+        logger.info("  [OK] LOW noise: All blocks on CPU, waiting")
+        logger.info("  [OK] Callbacks: HIGH->LOW switch + full cleanup registered")
+        logger.info("  [OK] After each iteration: Both models cleaned to CPU")
+        logger.info("  [OK] Unpin warnings: Suppressed for clean output")
+        
+        # Detect GGUF models and warn using our patcher instances
+        high_is_gguf = patcher_high._is_gguf_model if patcher_high else False
+        low_is_gguf = patcher_low._is_gguf_model if patcher_low else False
+        if high_is_gguf or low_is_gguf:
+            high_type = patcher_high._gguf_type if patcher_high else None
+            low_type = patcher_low._gguf_type if patcher_low else None
+            if high_type == "comfyui-gguf" or low_type == "comfyui-gguf":
+                logger.info("  [!] ComfyUI-GGUF detected: Using extra-safe block movement mode")
+                logger.info("      If CUDA errors occur after 2-3 runs, restart ComfyUI")
+            else:
+                logger.info("  [!] GGUF model detected: Using safe block movement mode")
+        
         logger.info("=" * 60)
+        
+        # Final CUDA health check
+        if not is_cuda_healthy():
+            logger.warning("CUDA may be unstable after setup - if errors occur, restart ComfyUI")
         
         return (model_high, model_low)
 

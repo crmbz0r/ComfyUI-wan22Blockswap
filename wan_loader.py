@@ -1,16 +1,14 @@
 ﻿"""
-WANModelLoader: A simple, clean all-in-one WAN model loader.
+WANModelLoader: GGUF-focused WAN model loader.
 
-This loader handles both safetensors and GGUF WAN models with
-automatic version and variant detection. No BlockSwap complexity -
-just load the model and let the separate BlockSwap nodes handle
-block swapping if needed.
+This loader handles GGUF WAN models with automatic version and variant
+detection. Uses the same stable loading approach as ComfyUI-GGUF's
+Advanced loader to avoid CUDA corruption issues.
 
 Supports:
 - WAN 2.1 (1.3B, 5B, 14B) and WAN 2.2 models
 - All variants: T2V, I2V, VACE, Camera, S2V, Humo, Animate
-- safetensors and GGUF formats
-- Optional FP8 quantization for additional VRAM savings
+- GGUF quantized format only (optimized for BlockSwap)
 """
 
 import torch
@@ -21,13 +19,8 @@ from typing import Optional, Dict, Any, Tuple
 import folder_paths
 import comfy.model_management as mm
 import comfy.utils
+import comfy.sd
 
-from .loader_helpers import (
-    detect_model_format,
-    load_state_dict_to_cpu,
-    create_model_skeleton,
-    create_model_patcher,
-)
 from .model_detection import detect_wan_config
 
 logger = logging.getLogger("WANModelLoader")
@@ -50,19 +43,18 @@ _register_gguf_extension()
 
 class WANModelLoader:
     """
-    Simple all-in-one WAN model loader.
+    GGUF-focused WAN model loader.
 
-    Loads WAN 2.1/2.2 models in safetensors or GGUF format with
-    automatic configuration detection. No BlockSwap - just pure
-    model loading.
+    Loads WAN 2.1/2.2 models in GGUF format with automatic configuration
+    detection. Uses ComfyUI-GGUF's proven stable loading approach.
 
     For BlockSwap functionality, connect the output to a
     WAN22BlockSwap node.
 
     Features:
     - Auto-detects WAN version (2.1/2.2) and variant (T2V/I2V/etc)
-    - Supports safetensors and GGUF quantized models
-    - Optional FP8 optimization for additional VRAM savings
+    - GGUF quantized models only (safetensors removed for stability)
+    - Advanced GGUF options for stable multi-run operation
     - Clean, simple interface
     """
 
@@ -79,34 +71,31 @@ class WANModelLoader:
         except Exception:
             all_models = []
 
-        # Filter by format
-        safetensors_ext = [".safetensors", ".sft"]
-        safetensors_models = sorted([
-            p for p in all_models
-            if any(p.lower().endswith(ext) for ext in safetensors_ext)
-        ])
-
+        # Filter for GGUF only
         gguf_models = sorted([
             p for p in all_models
             if p.lower().endswith(".gguf")
         ])
 
-        if not safetensors_models:
-            safetensors_models = ["no safetensors models found"]
         if not gguf_models:
             gguf_models = ["no gguf models found"]
 
         return {
             "required": {
-                "model_type": (["safetensors", "gguf"], {
-                    "default": "safetensors",
-                    "tooltip": "Model format to load."
-                }),
-                "safetensors_model": (safetensors_models, {
-                    "tooltip": "Safetensors model from diffusion_models folder"
-                }),
                 "gguf_model": (gguf_models, {
                     "tooltip": "GGUF quantized model from diffusion_models folder"
+                }),
+                "dequant_dtype": (["default", "target", "float32", "float16", "bfloat16"], {
+                    "default": "default",
+                    "tooltip": "Data type for dequantized weights. 'default'=float16, 'target'=match input."
+                }),
+                "patch_dtype": (["default", "target", "float32", "float16", "bfloat16"], {
+                    "default": "default",
+                    "tooltip": "Data type for LoRA patches. 'default'=float16, 'target'=match input."
+                }),
+                "patch_on_device": ("BOOLEAN", {
+                    "default": False,
+                    "tooltip": "Keep patches on GPU. Uses more VRAM but faster with LoRAs."
                 }),
             },
             "optional": {
@@ -121,89 +110,98 @@ class WANModelLoader:
                         "tooltip": "WAN model variant. 'auto' detects from weights."
                     }
                 ),
-                "fp8_optimization": (["disabled", "e4m3fn", "e5m2"], {
-                    "default": "disabled",
-                    "tooltip": "Apply FP8 quantization for additional memory savings."
-                }),
-                "weight_dtype": (["auto", "fp16", "bf16", "fp32"], {
-                    "default": "auto",
-                    "tooltip": "Data type for model weights. 'auto' uses native dtype."
-                }),
             }
         }
 
     def load_model(
         self,
-        model_type: str,
-        safetensors_model: str,
         gguf_model: str,
+        dequant_dtype: str = "default",
+        patch_dtype: str = "default",
+        patch_on_device: bool = False,
         wan_version: str = "auto",
         model_variant: str = "auto",
-        fp8_optimization: str = "disabled",
-        weight_dtype: str = "auto",
     ) -> Tuple[Any]:
         """
-        Load a WAN model.
+        Load a GGUF WAN model using ComfyUI-GGUF's stable loading approach.
 
         Args:
-            model_type: "safetensors" or "gguf"
-            safetensors_model: Model name for safetensors format
-            gguf_model: Model name for GGUF format
+            gguf_model: GGUF model filename
+            dequant_dtype: Dequantization dtype
+            patch_dtype: LoRA patch dtype
+            patch_on_device: Keep patches on GPU
             wan_version: WAN version ("auto", "2.1", "2.2")
             model_variant: Model variant type
-            fp8_optimization: FP8 quantization mode
-            weight_dtype: Weight data type
 
         Returns:
             Tuple containing ModelPatcher
         """
-        # Determine model path
-        if model_type == "gguf":
-            model_path = gguf_model
-            if model_path == "no gguf models found":
-                raise FileNotFoundError(
-                    "No GGUF models found. Add .gguf files to models/diffusion_models/"
-                )
-        else:
-            model_path = safetensors_model
-            if model_path == "no safetensors models found":
-                raise FileNotFoundError(
-                    "No safetensors models found. Add .safetensors files to models/diffusion_models/"
-                )
+        if gguf_model == "no gguf models found":
+            raise FileNotFoundError(
+                "No GGUF models found. Add .gguf files to models/diffusion_models/"
+            )
 
-        full_path = folder_paths.get_full_path("diffusion_models", model_path)
+        full_path = folder_paths.get_full_path("diffusion_models", gguf_model)
         if not full_path:
-            raise FileNotFoundError(f"Model not found: {model_path}")
+            raise FileNotFoundError(f"Model not found: {gguf_model}")
 
-        logger.info("╔══════════════════════════════════════════════════════════════")
-        logger.info(f"║ WAN Model Loader")
-        logger.info(f"║ Model: {model_path}")
-        logger.info(f"║ Format: {model_type}")
-        logger.info("╚══════════════════════════════════════════════════════════════")
+        logger.info("=" * 60)
+        logger.info("WAN Model Loader (GGUF)")
+        logger.info(f"  Model: {gguf_model}")
+        logger.info(f"  dequant_dtype: {dequant_dtype}")
+        logger.info(f"  patch_dtype: {patch_dtype}")
+        logger.info(f"  patch_on_device: {patch_on_device}")
+        logger.info("=" * 60)
 
         # Memory cleanup
         mm.unload_all_models()
         mm.soft_empty_cache()
 
-        # Load state dict
-        model_format = detect_model_format(full_path)
-        logger.info(f"Loading {model_format} model to CPU...")
+        # Import GGMLOps from ComfyUI-GGUF
+        try:
+            import sys
+            import os
+            gguf_folder = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "ComfyUI-GGUF")
+            if gguf_folder not in sys.path:
+                sys.path.insert(0, gguf_folder)
+            from ops import GGMLOps
+            from loader import gguf_sd_loader
+            from nodes import GGUFModelPatcher
+        except ImportError as e:
+            raise ImportError(
+                f"ComfyUI-GGUF not found: {e}\n"
+                "GGUF support requires ComfyUI-GGUF custom node:\n"
+                "  https://github.com/city96/ComfyUI-GGUF\n"
+                "Install via ComfyUI Manager or git clone into custom_nodes/"
+            )
 
-        state_dict, _, metadata = load_state_dict_to_cpu(full_path, model_format)
-        logger.info(f"Loaded {len(state_dict)} tensors")
+        # Create GGMLOps instance with proper settings (same as Advanced loader)
+        ops = GGMLOps()
 
-        # Detect GGUF
-        is_gguf_model = False
-        for tensor in state_dict.values():
-            if hasattr(tensor, 'tensor_type') and tensor.tensor_type is not None:
-                is_gguf_model = True
-                break
+        if dequant_dtype in ("default", None):
+            ops.Linear.dequant_dtype = None
+        elif dequant_dtype == "target":
+            ops.Linear.dequant_dtype = dequant_dtype
+        else:
+            ops.Linear.dequant_dtype = getattr(torch, dequant_dtype)
 
-        # Detect WAN config
+        if patch_dtype in ("default", None):
+            ops.Linear.patch_dtype = None
+        elif patch_dtype == "target":
+            ops.Linear.patch_dtype = patch_dtype
+        else:
+            ops.Linear.patch_dtype = getattr(torch, patch_dtype)
+
+        # Load GGUF state dict
+        logger.info("Loading GGUF model...")
+        sd = gguf_sd_loader(full_path)
+        logger.info(f"Loaded {len(sd)} tensors")
+
+        # Detect WAN config from state dict
         logger.info("Detecting WAN configuration...")
         try:
             wan_config = detect_wan_config(
-                state_dict,
+                sd,
                 wan_version=wan_version,
                 model_variant=model_variant,
             )
@@ -218,136 +216,34 @@ class WANModelLoader:
             f"dim={wan_config['dim']}"
         )
 
-        # Determine dtype
-        if weight_dtype == "auto":
-            sample_tensor = next(iter(state_dict.values()))
-            is_ggml = hasattr(sample_tensor, 'tensor_type') and sample_tensor.tensor_type is not None
-
-            if is_ggml:
-                model_dtype = torch.float16
-            elif sample_tensor.dtype in [torch.float16, torch.bfloat16, torch.float32]:
-                model_dtype = sample_tensor.dtype
-            else:
-                model_dtype = torch.float16
-        else:
-            dtype_map = {
-                "fp16": torch.float16,
-                "bf16": torch.bfloat16,
-                "fp32": torch.float32,
-            }
-            model_dtype = dtype_map.get(weight_dtype, torch.float16)
-
-        # For GGUF models, ignore weight_dtype and fp8 - they're already quantized
-        if is_gguf_model:
-            if weight_dtype != "auto":
-                logger.warning("GGUF models ignore weight_dtype setting - using native GGUF quantization")
-            if fp8_optimization != "disabled":
-                logger.warning("GGUF models ignore FP8 optimization - using native GGUF quantization")
-            fp8_optimization = "disabled"  # Force disable for GGUF
-
-        logger.info(f"Using dtype: {model_dtype}")
-
-        # Create model
-        logger.info("Creating model...")
-        model = create_model_skeleton(
-            wan_config=wan_config,
-            dtype=model_dtype,
-            device="meta",
-            is_gguf=is_gguf_model,
+        # Load model using ComfyUI's standard loader with our custom ops
+        # This is the same approach as UnetLoaderGGUFAdvanced
+        logger.info("Creating model with GGMLOps...")
+        model = comfy.sd.load_diffusion_model_state_dict(
+            sd, model_options={"custom_operations": ops}
         )
 
-        # Assign weights - all to GPU (no block routing here)
-        main_device = mm.get_torch_device()
-        logger.info(f"Assigning weights to {main_device}...")
+        if model is None:
+            logger.error(f"ERROR UNSUPPORTED UNET {full_path}")
+            raise RuntimeError(f"ERROR: Could not detect model type of: {full_path}")
 
-        self._assign_weights_simple(
-            model=model,
-            state_dict=state_dict,
-            device=main_device,
-            fp8_optimization=fp8_optimization,
-        )
+        # Convert to GGUFModelPatcher for proper GGUF handling
+        model = GGUFModelPatcher.clone(model)
+        model.patch_on_device = patch_on_device
 
-        # Create patcher
-        model_patcher = create_model_patcher(
-            diffusion_model=model,
-            wan_config=wan_config,
-            load_device=main_device,
-            offload_device=mm.unet_offload_device(),
-            blocks_to_swap=0,  # No pre-routing
-            is_gguf=is_gguf_model,
-        )
+        # Store WAN config on model for BlockSwap nodes
+        model.wan_config = wan_config
 
         # Cleanup
-        del state_dict
+        del sd
         mm.soft_empty_cache()
 
-        logger.info("╔══════════════════════════════════════════════════════════════")
-        logger.info(f"║ ✓ Model loaded successfully!")
-        logger.info(f"║   Use WAN22BlockSwap node for block swapping if needed")
-        logger.info("╚══════════════════════════════════════════════════════════════")
+        logger.info("=" * 60)
+        logger.info("Model loaded successfully!")
+        logger.info("  Use WAN22BlockSwap node for block swapping if needed")
+        logger.info("=" * 60)
 
-        return (model_patcher,)
-
-    def _assign_weights_simple(
-        self,
-        model: Any,
-        state_dict: Dict[str, torch.Tensor],
-        device: torch.device,
-        fp8_optimization: str = "disabled",
-    ) -> None:
-        """
-        Assign weights from state dict to model.
-
-        Simple weight assignment without block routing.
-        All weights go to the specified device.
-
-        Args:
-            model: The model to assign weights to
-            state_dict: State dict with weights
-            device: Target device for all weights
-            fp8_optimization: FP8 quantization mode
-        """
-        # Get FP8 dtype if enabled
-        fp8_dtype = None
-        if fp8_optimization == "e4m3fn" and hasattr(torch, 'float8_e4m3fn'):
-            fp8_dtype = torch.float8_e4m3fn
-        elif fp8_optimization == "e5m2" and hasattr(torch, 'float8_e5m2'):
-            fp8_dtype = torch.float8_e5m2
-
-        assigned = 0
-        skipped = 0
-
-        for key, tensor in state_dict.items():
-            try:
-                # Check if it's a GGMLTensor (GGUF quantized)
-                is_ggml = hasattr(tensor, 'tensor_type') and tensor.tensor_type is not None
-
-                if is_ggml:
-                    # GGMLTensor - use comfy.utils for proper assignment
-                    try:
-                        comfy.utils.set_attr_param(model, key, tensor)
-                        assigned += 1
-                    except Exception:
-                        skipped += 1
-                else:
-                    # Regular tensor - move to device first
-                    tensor_device = tensor.to(device)
-
-                    # Apply FP8 if enabled
-                    if fp8_dtype is not None and tensor_device.dtype in [torch.float16, torch.bfloat16, torch.float32]:
-                        tensor_device = tensor_device.to(fp8_dtype)
-
-                    try:
-                        comfy.utils.set_attr_param(model, key, tensor_device)
-                        assigned += 1
-                    except Exception:
-                        skipped += 1
-
-            except Exception:
-                skipped += 1
-                continue
-
-        logger.info(f"Assigned {assigned} weights, skipped {skipped}")
+        return (model,)
 
 
 # Node registration
@@ -356,5 +252,5 @@ NODE_CLASS_MAPPINGS = {
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
-    "WANModelLoader": "WAN Model Loader",
+    "WANModelLoader": "WAN Model Loader (GGUF)",
 }
